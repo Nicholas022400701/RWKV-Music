@@ -15,16 +15,18 @@ class CopilotDataset(Dataset):
     Handles context-completion pairs with variable length support.
     """
     
-    def __init__(self, data_pairs: List[Dict[str, List[int]]], max_seq_len: Optional[int] = None):
+    def __init__(self, data_pairs: List[Dict[str, List[int]]], max_seq_len: Optional[int] = None, tokenizer=None):
         """
         Initialize dataset from preprocessed context-completion pairs.
         
         Args:
             data_pairs: List of dicts with 'context' and 'completion' keys
             max_seq_len: Maximum sequence length (for truncation), None for no limit
+            tokenizer: PianoTokenizer instance for safe structural boundary detection
         """
         self.data = data_pairs
         self.max_seq_len = max_seq_len
+        self.tokenizer = tokenizer
         
     def __len__(self) -> int:
         return len(self.data)
@@ -57,13 +59,19 @@ class CopilotDataset(Dataset):
                 if len(ctx_tokens) > new_ctx_len and new_ctx_len >= 2:
                     # Keep first 2 metadata tokens + tail portion
                     metadata_tokens = ctx_tokens[:2]
-                    remaining_ctx = ctx_tokens[2:]
-                    # Calculate how many tokens to keep from remaining context
-                    keep_from_remaining = new_ctx_len - 2
-                    if keep_from_remaining > 0:
-                        ctx_tokens = metadata_tokens + remaining_ctx[-keep_from_remaining:]
-                    else:
-                        ctx_tokens = metadata_tokens
+                    target_idx = len(ctx_tokens) - (new_ctx_len - 2)
+                    
+                    # Ensure safe atomic truncation at musical boundaries
+                    if self.tokenizer is not None and hasattr(self.tokenizer, 'is_structural_token'):
+                        while target_idx < len(ctx_tokens):
+                            if self.tokenizer.is_structural_token(ctx_tokens[target_idx]):
+                                break
+                            target_idx += 1
+                        if target_idx == len(ctx_tokens):
+                            # No structural token found, fallback to original target
+                            target_idx = len(ctx_tokens) - (new_ctx_len - 2)
+                    
+                    ctx_tokens = metadata_tokens + ctx_tokens[target_idx:]
                 else:
                     # Can fit entire context or context is too short
                     ctx_tokens = ctx_tokens[-new_ctx_len:]
@@ -77,13 +85,19 @@ class CopilotDataset(Dataset):
                 # CRITICAL FIX: Always preserve first 2 metadata tokens
                 if len(ctx_tokens) >= 2 and keep_ctx >= 2:
                     metadata_tokens = ctx_tokens[:2]
-                    if keep_ctx > 2:
-                        # Keep metadata + tail of context
-                        remaining_ctx = ctx_tokens[2:]
-                        ctx_tokens = metadata_tokens + remaining_ctx[-(keep_ctx - 2):]
-                    else:
-                        # Only keep metadata tokens
-                        ctx_tokens = metadata_tokens
+                    target_idx = len(ctx_tokens) - (keep_ctx - 2)
+                    
+                    # Ensure safe atomic truncation at musical boundaries
+                    if self.tokenizer is not None and hasattr(self.tokenizer, 'is_structural_token'):
+                        while target_idx < len(ctx_tokens):
+                            if self.tokenizer.is_structural_token(ctx_tokens[target_idx]):
+                                break
+                            target_idx += 1
+                        if target_idx == len(ctx_tokens):
+                            # No structural token found, fallback to original target
+                            target_idx = len(ctx_tokens) - (keep_ctx - 2)
+                    
+                    ctx_tokens = metadata_tokens + ctx_tokens[target_idx:]
                 else:
                     # Fallback: keep last tokens if no metadata
                     ctx_tokens = ctx_tokens[-keep_ctx:]
