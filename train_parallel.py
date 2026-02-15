@@ -25,7 +25,7 @@ def compute_loss_with_masking(
     logits: torch.Tensor,
     targets: torch.Tensor,
     ctx_lengths: torch.Tensor,
-    attention_mask: torch.Tensor
+    padding_token_id: int = 0
 ) -> torch.Tensor:
     """
     Compute cross-entropy loss with physical slicing.
@@ -37,7 +37,7 @@ def compute_loss_with_masking(
         logits: Already sliced logits [sum(completion_lengths), vocab_size]
         targets: Full target sequence [batch_size, seq_len]
         ctx_lengths: Context length for each sequence [batch_size]
-        attention_mask: Attention mask [batch_size, seq_len]
+        padding_token_id: Token ID used for padding (default: 0)
     
     Returns:
         Scalar loss tensor
@@ -53,9 +53,8 @@ def compute_loss_with_masking(
         completion_targets = targets[b, ctx_len-1:]
         
         # Apply the same padding mask - only keep non-padded tokens
-        # ASSUMPTION: Padding tokens are 0 (as defined in collate_fn in dataset.py)
-        # This should match the tokenization scheme used throughout the codebase
-        non_pad_mask = completion_targets != 0
+        # NOTE: Padding token ID must match the value used in collate_fn
+        non_pad_mask = completion_targets != padding_token_id
         if non_pad_mask.any():
             valid_targets.append(completion_targets[non_pad_mask])
     
@@ -119,7 +118,6 @@ def train_epoch(
         input_ids = batch['input_ids'].to(device)
         target_ids = batch['target_ids'].to(device)
         ctx_lengths = batch['ctx_lengths']
-        attention_mask = batch['attention_mask'].to(device)
         
         # Zero gradients
         optimizer.zero_grad(set_to_none=True)
@@ -132,7 +130,8 @@ def train_epoch(
             logits = model(input_ids, ctx_lengths=ctx_lengths)
             
             # Compute loss with synchronized target slicing
-            loss = compute_loss_with_masking(logits, target_ids, ctx_lengths, attention_mask)
+            # Using padding_token_id=0 as defined in dataset.collate_fn
+            loss = compute_loss_with_masking(logits, target_ids, ctx_lengths, padding_token_id=0)
         
         # Backward pass - no scaling needed with BF16
         loss.backward()

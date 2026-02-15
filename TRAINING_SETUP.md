@@ -8,9 +8,9 @@ The original codebase incorrectly used the **inference-only** `rwkv` pip package
 2. ❌ No CUDA kernels for `wkv_cuda_backward` 
 3. ❌ Training would crash on first backward pass
 
-## Solution: Training-Capable Model
+## Solution: Training-Capable RWKV v8 "Heron" Model
 
-This repository now includes the proper **training-capable** RWKV model from the official [RWKV-LM](https://github.com/BlinkDL/RWKV-LM) repository with full backward pass support.
+This repository now includes the proper **training-capable** RWKV v8 "Heron" model from the official [RWKV-LM](https://github.com/BlinkDL/RWKV-LM) repository with full backward pass support.
 
 ### What Changed
 
@@ -23,15 +23,24 @@ rwkv>=0.8.0  # ❌ Inference-only, no training support
 from rwkv.model import RWKV  # ❌ Will crash during training
 ```
 
-**AFTER (Fixed):**
+**AFTER (Fixed - Using v8):**
 ```python
 # requirements.txt
-# rwkv removed - using training model from core/rwkv_training/
-pytorch-lightning>=2.0.0  # ✅ Required for training model
+# rwkv removed - using RWKV v8 training model from core/rwkv_training/
+pytorch-lightning>=2.0.0  # ✅ Required for training
 
 # architecture.py
-from core.rwkv_training.model import RWKV  # ✅ Full training support
+from core.rwkv_training.rwkv_v8_model import RWKV_x070  # ✅ v8 "Heron" with full training support
 ```
+
+## RWKV v8 "Heron" Architecture
+
+RWKV v8 is the **latest architecture** featuring:
+- ✅ Advanced WKV7s (state-based) CUDA kernels
+- ✅ Improved attention and FFN mechanisms
+- ✅ Better long-context handling
+- ✅ Enhanced numerical stability
+- ✅ Token-specific adaptations via `enn.weight`
 
 ## Prerequisites for Training
 

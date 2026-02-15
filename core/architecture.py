@@ -196,8 +196,9 @@ class PianoMuseRWKV(nn.Module):
             # For training mode, we need gradient-enabled operations
             for i, block in enumerate(self.model.w.blocks):
                 # Use the actual block forward if available
+                # Note: RWKV blocks handle residual connections internally
                 if hasattr(block, 'forward'):
-                    x = x + block.forward(x, None)  # Add residual
+                    x = block.forward(x, None)
                 else:
                     # Fallback: use RWKV's built-in operations
                     # Time mixing (attention)
@@ -243,12 +244,11 @@ class PianoMuseRWKV(nn.Module):
             return block.att.forward(x_norm, None)
         
         # Fallback should not be reached with proper RWKV library
-        # Log warning and raise exception to prevent silent failures
-        import warnings
-        warnings.warn("RWKV attention module does not have forward method. This indicates an incompatible RWKV library version.")
         raise RuntimeError(
             "RWKV attention (time mixing) module is incompatible. "
-            "Please ensure you're using the correct RWKV library version with training support."
+            "The module does not have a forward method, indicating an incompatible RWKV library version. "
+            "Please ensure you're using the training-capable model from core/rwkv_training/ "
+            "or the correct RWKV library version with training support."
         )
     
     def _compute_ffn_output(self, x: torch.Tensor, block) -> torch.Tensor:
@@ -272,12 +272,11 @@ class PianoMuseRWKV(nn.Module):
             return block.ffn.forward(x_norm)
         
         # Fallback should not be reached with proper RWKV library
-        # Log warning and raise exception to prevent silent failures
-        import warnings
-        warnings.warn("RWKV FFN module does not have forward method. This indicates an incompatible RWKV library version.")
         raise RuntimeError(
             "RWKV FFN (channel mixing) module is incompatible. "
-            "Please ensure you're using the correct RWKV library version with training support."
+            "The module does not have a forward method, indicating an incompatible RWKV library version. "
+            "Please ensure you're using the training-capable model from core/rwkv_training/ "
+            "or the correct RWKV library version with training support."
         )
     
     def _project_to_vocab(self, hidden: torch.Tensor) -> torch.Tensor:
