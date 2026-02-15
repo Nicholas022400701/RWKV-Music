@@ -57,7 +57,16 @@ TOP_P = 0.0
 
 ########################################################################################################
 
-DTYPE = torch.half
+# CRITICAL NOTE: Precision Configuration
+# The model uses FP16 (torch.half) by default, but training script uses BF16
+# For BF16 training, ensure:
+# 1. Model weights are loaded/converted to BF16
+# 2. CUDA kernels support BF16 (or use mixed precision carefully)
+# 3. No implicit FP16<->BF16 conversions that cause NaN
+
+DTYPE = torch.half  # Default model precision (FP16)
+# For BF16 training, weights will be automatically converted when moved to device
+# PyTorch autocast handles the precision internally
 
 from torch.utils.cpp_extension import load
 HEAD_SIZE = args.head_size

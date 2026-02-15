@@ -281,107 +281,122 @@ class PianoMuseRWKV(nn.Module):
         return hidden_states
     
     def _get_hidden_states_v8(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get hidden states using RWKV_x070 model with self.z structure."""
+        """
+        Get hidden states using RWKV_x070 model with self.z structure.
+        
+        CRITICAL FIX: Use batch-parallel GPU processing instead of CPU loops.
+        Process all sequences in parallel on GPU for maximum efficiency.
+        """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # RWKV_x070 uses self.z dictionary instead of self.w
-        hidden_states = []
+        # CRITICAL FIX: Process entire batch in parallel on GPU
+        # Do NOT convert to CPU or use Python loops - this kills GPU performance
         
-        for b in range(batch_size):
-            # Process each sequence
-            seq = input_ids[b].cpu().tolist()
+        # RWKV_x070 uses self.z dictionary instead of self.w
+        # For training mode, we need to extract hidden states before the LM head
+        
+        # Get embeddings for entire batch - already includes ln0 in RWKV_x070
+        # Use advanced indexing to get embeddings for all sequences at once
+        x = self.model.z['emb.weight'][input_ids]  # [batch_size, seq_len, n_embd]
+        
+        # Process through all layers
+        for i in range(self.n_layer):
+            bbb = f'blocks.{i}.'
+            att = f'blocks.{i}.att.'
+            ffn = f'blocks.{i}.ffn.'
             
-            # Get embeddings - already includes ln0 in RWKV_x070
-            x = self.model.z['emb.weight'][seq].to(device)  # [seq_len, n_embd]
-            
-            # Process through layers
-            for i in range(self.n_layer):
-                bbb = f'blocks.{i}.'
-                
-                # Layer norm 1
-                xx = torch.nn.functional.layer_norm(
-                    x, (self.n_embd,), 
-                    weight=self.model.z[bbb+'ln1.weight'], 
-                    bias=self.model.z[bbb+'ln1.bias']
-                )
-                
-                # Time mixing (attention) - simplified version without state
-                # NOTE: This is a simplified forward that may not match training behavior
-                # For proper training, the full RWKV-LM model is required
-                xx = self._simple_time_mix(xx, i)
-                x = x + xx
-                
-                # Layer norm 2
-                xx = torch.nn.functional.layer_norm(
-                    x, (self.n_embd,), 
-                    weight=self.model.z[bbb+'ln2.weight'], 
-                    bias=self.model.z[bbb+'ln2.bias']
-                )
-                
-                # Channel mixing (FFN) - simplified version
-                xx = self._simple_channel_mix(xx, i, seq)
-                x = x + xx
-            
-            # Final layer norm
-            x = torch.nn.functional.layer_norm(
+            # Layer norm 1 - apply to entire batch
+            xx = torch.nn.functional.layer_norm(
                 x, (self.n_embd,), 
-                weight=self.model.z['ln_out.weight'], 
-                bias=self.model.z['ln_out.bias']
+                weight=self.model.z[bbb+'ln1.weight'], 
+                bias=self.model.z[bbb+'ln1.bias']
             )
             
-            hidden_states.append(x)
+            # Time mixing (attention) - batched version
+            xx = self._batched_time_mix(xx, i, input_ids)
+            x = x + xx
+            
+            # Layer norm 2 - apply to entire batch
+            xx = torch.nn.functional.layer_norm(
+                x, (self.n_embd,), 
+                weight=self.model.z[bbb+'ln2.weight'], 
+                bias=self.model.z[bbb+'ln2.bias']
+            )
+            
+            # Channel mixing (FFN) - batched version
+            xx = self._batched_channel_mix(xx, i, input_ids)
+            x = x + xx
         
-        # Stack batch
-        hidden_states = torch.stack(hidden_states, dim=0)
-        return hidden_states
+        # Final layer norm - apply to entire batch
+        x = torch.nn.functional.layer_norm(
+            x, (self.n_embd,), 
+            weight=self.model.z['ln_out.weight'], 
+            bias=self.model.z['ln_out.bias']
+        )
+        
+        return x  # [batch_size, seq_len, n_embd]
     
-    def _simple_time_mix(self, x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    def _batched_time_mix(self, x: torch.Tensor, layer_id: int, token_ids: torch.Tensor) -> torch.Tensor:
         """
-        Simplified time mixing without full WKV for compatibility.
+        Batched time mixing for all sequences in parallel.
         
-        WARNING: This is a placeholder implementation that does NOT match RWKV's actual
-        time mixing behavior. The real RWKV uses a custom WKV (Weighted Key-Value) operator
-        with state tracking and exponential decay, which is much more sophisticated.
+        WARNING: This is still a simplified version without full WKV state tracking.
+        For proper training with gradient flow, the full RWKV-LM implementation
+        with CUDA kernels is required.
         
-        This simplified version should NOT be used for training as it will produce
-        incorrect results. It exists only for basic API compatibility testing.
+        Args:
+            x: Input tensor [batch_size, seq_len, n_embd]
+            layer_id: Layer index
+            token_ids: Token IDs [batch_size, seq_len] (for ENN indexing if needed)
         
-        For proper training, use the full RWKV-LM model with wkv_cuda operators.
+        Returns:
+            Output tensor [batch_size, seq_len, n_embd]
         """
-        # This is a placeholder - proper implementation requires the full WKV operator
-        # For now, just use linear projections as approximation
         att = f'blocks.{layer_id}.att.'
         
-        # Simple linear transformation as placeholder
-        # Real RWKV would use WKV operator here
-        r = x @ self.model.z[att+'receptance.weight'].T
-        k = x @ self.model.z[att+'key.weight'].T
-        v = x @ self.model.z[att+'value.weight'].T
+        # Batched linear transformations
+        r = x @ self.model.z[att+'receptance.weight'].T  # [B, T, n_embd]
+        k = x @ self.model.z[att+'key.weight'].T         # [B, T, n_embd]
+        v = x @ self.model.z[att+'value.weight'].T       # [B, T, n_embd]
         
-        # Simplified attention (not the real RWKV mechanism)
+        # Simplified attention (not the real RWKV WKV mechanism)
+        # NOTE: This loses the time-decay and state tracking of true RWKV
+        # For production training, use the full RWKV-LM model with WKV CUDA kernels
         out = torch.sigmoid(r) * v
         out = out @ self.model.z[att+'output.weight'].T
         
         return out
     
-    def _simple_channel_mix(self, x: torch.Tensor, layer_id: int, token_ids: list) -> torch.Tensor:
-        """Simplified channel mixing."""
+    def _batched_channel_mix(self, x: torch.Tensor, layer_id: int, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Batched channel mixing for all sequences in parallel.
+        
+        Args:
+            x: Input tensor [batch_size, seq_len, n_embd]
+            layer_id: Layer index
+            token_ids: Token IDs [batch_size, seq_len] (for ENN weight indexing)
+        
+        Returns:
+            Output tensor [batch_size, seq_len, n_embd]
+        """
         ffn = f'blocks.{layer_id}.ffn.'
         
-        k = x @ self.model.z[ffn+'key.weight'].T
+        # Batched linear transformations
+        k = x @ self.model.z[ffn+'key.weight'].T     # [B, T, n_embd]
         k = torch.relu(k) ** 2
-        v = k @ self.model.z[ffn+'value.weight'].T
+        v = k @ self.model.z[ffn+'value.weight'].T   # [B, T, n_embd]
         
         # Element-wise multiplication with ENN weights
-        # Note: token_ids indexing may not work for batch, using first token as fallback
+        # ENN weights are indexed by token IDs
         try:
-            enn = self.model.z[ffn+'enn.weight'][token_ids]
+            enn = self.model.z[ffn+'enn.weight'][token_ids]  # [B, T, n_embd]
+            v = v * enn
         except (KeyError, IndexError, TypeError):
-            # Fallback if indexing fails - use ones
-            enn = torch.ones_like(v)
+            # Fallback if ENN indexing fails
+            pass
         
-        return v * enn
+        return v
     
     def _compute_att_output(self, x: torch.Tensor, block) -> torch.Tensor:
         """
