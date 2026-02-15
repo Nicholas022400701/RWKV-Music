@@ -4,6 +4,25 @@
 #
 # This version is GPT-mode + RNN-mode, and a bit more difficult to understand
 #
+# CRITICAL NOTE ON TRAINING SUPPORT:
+# -----------------------------------
+# This implementation includes the forward pass and WKV7s CUDA kernel, but the backward pass
+# raises NotImplementedError (line 90-98). This is an inference-only implementation.
+# 
+# For full training with gradient computation, you need:
+# 1. A complete wkv_cuda_backward implementation
+# 2. Proper gradient computation through the WKV operator
+# 3. State tracking with requires_grad=True
+#
+# The current implementation wraps forward in torch.no_grad() which breaks autograd.
+# 
+# For production training:
+# - Either implement wkv_cuda_backward for WKV_7
+# - Or use a pure PyTorch implementation with torch.autograd.Function
+# - Or use the full RWKV-LM training codebase with all gradient operators
+#
+# The architecture.py wrapper works around this by using simplified batched operations
+# that maintain gradient flow, but these don't implement true RWKV time-decay mechanics.
 ########################################################################################################
 
 import numpy as np
@@ -57,7 +76,16 @@ TOP_P = 0.0
 
 ########################################################################################################
 
-DTYPE = torch.half
+# CRITICAL NOTE: Precision Configuration
+# The model uses FP16 (torch.half) by default, but training script uses BF16
+# For BF16 training, ensure:
+# 1. Model weights are loaded/converted to BF16
+# 2. CUDA kernels support BF16 (or use mixed precision carefully)
+# 3. No implicit FP16<->BF16 conversions that cause NaN
+
+DTYPE = torch.half  # Default model precision (FP16)
+# For BF16 training, weights will be automatically converted when moved to device
+# PyTorch autocast handles the precision internally
 
 from torch.utils.cpp_extension import load
 HEAD_SIZE = args.head_size

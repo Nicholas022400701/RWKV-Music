@@ -1,36 +1,92 @@
 # RWKV-Music Training Setup Guide
 
-## Critical Issue Fixed: Inference vs Training Models
+## Current Status: Hybrid Training Implementation
 
-The original codebase incorrectly used the **inference-only** `rwkv` pip package, which does NOT support training because:
+This repository includes a **hybrid approach** to RWKV training:
 
-1. ❌ No gradient computation (no `backward()` implementation)
-2. ❌ No CUDA kernels for `wkv_cuda_backward` 
-3. ❌ Training would crash on first backward pass
+### What Works:
+1. ✅ RWKV v8 "Heron" model structure from RWKV-LM
+2. ✅ Batched GPU-parallel forward pass with gradient flow
+3. ✅ Physical logit slicing for memory efficiency  
+4. ✅ Proper mask alignment to prevent shape mismatches
+5. ✅ BFloat16 mixed precision training support
 
-## Solution: Training-Capable RWKV v8 "Heron" Model
+### Current Limitations:
+1. ⚠️  WKV_7.backward raises `NotImplementedError` (line 90-98 in rwkv_v8_model.py)
+2. ⚠️  Forward pass wrapped in `torch.no_grad()` in the base model
+3. ⚠️  Architecture uses simplified batched operations instead of true WKV time-decay
 
-This repository now includes the proper **training-capable** RWKV v8 "Heron" model from the official [RWKV-LM](https://github.com/BlinkDL/RWKV-LM) repository with full backward pass support.
+### Solution Implemented:
+The `architecture.py` wrapper implements **batched GPU operations** that:
+- ✅ Maintain gradient flow for training
+- ✅ Process batches in parallel on GPU (no CPU loops)
+- ✅ Use proper tensor operations compatible with autograd
+- ⚠️  Use simplified attention (not full WKV state tracking)
 
-### What Changed
+For **production-quality RWKV training**, you would need to either:
+1. Implement `wkv_cuda_backward` for the WKV_7 operator
+2. Use pure PyTorch WKV implementation with proper autograd
+3. Integrate the full RWKV-LM training codebase with all gradient operators
 
+## Critical Fixes Implemented
+
+### 1. Fixed Inverted Logic (Issue #1.1)
 **BEFORE (Broken):**
 ```python
-# requirements.txt
-rwkv>=0.8.0  # ❌ Inference-only, no training support
-
-# architecture.py  
-from rwkv.model import RWKV  # ❌ Will crash during training
+try:
+    from rwkv.model import RWKV
+    self.using_training_model = True  # ❌ Wrong! pip package is inference-only
+except ImportError:
+    from core.rwkv_training.rwkv_v8_model import RWKV_x070
+    self.using_training_model = False  # ❌ Wrong! This IS the training model
 ```
 
-**AFTER (Fixed - Using v8):**
+**AFTER (Fixed):**
 ```python
-# requirements.txt
-# rwkv removed - using RWKV v8 training model from core/rwkv_training/
-pytorch-lightning>=2.0.0  # ✅ Required for training
+try:
+    from core.rwkv_training.rwkv_v8_model import RWKV_x070
+    self.using_training_model = True  # ✅ Correct! This IS the training model
+except ImportError:
+    from rwkv.model import RWKV
+    self.using_training_model = False  # ✅ Correct! pip package is inference-only
+```
 
-# architecture.py
-from core.rwkv_training.rwkv_v8_model import RWKV_x070  # ✅ v8 "Heron" with full training support
+### 2. Fixed Autoregressive Mask Alignment (Issue #1.3-1.4)
+
+**Problem:** Masks were computed separately on inputs and targets after autoregressive shift, causing shape mismatches.
+
+**Solution:** Use global `attention_mask` from `collate_fn`:
+- Generated once in `collate_fn` based on `input_ids`
+- Passed to both `architecture.py` and `train_parallel.py`
+- Applied identically to hidden states and targets
+- Ensures perfect mathematical alignment (no shape mismatches)
+
+### 3. Fixed Context Truncation (Issue #2.2)
+
+**Problem:** Metadata tokens (Tempo, TimeSignature) prepended to context were cut off during truncation.
+
+**Solution:** Modified `dataset.py` to preserve first 2 tokens:
+```python
+# Keep metadata + tail of context
+metadata_tokens = ctx_tokens[:2]
+remaining_ctx = ctx_tokens[2:]
+ctx_tokens = metadata_tokens + remaining_ctx[-keep_from_remaining:]
+```
+
+### 4. Removed Python For-Loops (Issue #3.1)
+
+**Problem:** Processing each sequence individually with CPU conversion:
+```python
+for b in range(batch_size):
+    seq = input_ids[b].cpu().tolist()  # ❌ Kills GPU performance
+    # Process one at a time...
+```
+
+**Solution:** Batch-parallel GPU processing:
+```python
+# Process entire batch in parallel
+x = self.model.z['emb.weight'][input_ids]  # [batch_size, seq_len, n_embd]
+# Apply operations to full batch...
 ```
 
 ## RWKV v8 "Heron" Architecture

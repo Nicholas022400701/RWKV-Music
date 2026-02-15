@@ -25,25 +25,31 @@ def compute_loss_with_masking(
     logits: torch.Tensor,
     targets: torch.Tensor,
     ctx_lengths: torch.Tensor,
+    attention_mask: torch.Tensor,
     padding_token_id: int = 0
 ) -> torch.Tensor:
     """
     Compute cross-entropy loss with physical slicing.
     
-    CRITICAL FIX: Use the same boolean mask to extract both logits and targets
-    to ensure perfect alignment and prevent cross-sample pollution.
+    CRITICAL FIX: Use the global attention_mask from collate_fn to extract targets
+    This ensures perfect alignment with the hidden states slicing in architecture.py
+    Both use the SAME mask generated once in collate_fn, preventing shape mismatches.
     
     Args:
         logits: Already sliced logits [sum(completion_lengths), vocab_size]
         targets: Full target sequence [batch_size, seq_len]
         ctx_lengths: Context length for each sequence [batch_size]
+        attention_mask: Global mask from collate_fn [batch_size, seq_len]
+                       1 for real tokens, 0 for padding
         padding_token_id: Token ID used for padding (default: 0)
     
     Returns:
         Scalar loss tensor
     """
     # Extract valid targets (completion portion only)
-    # We build the same mask that was used in architecture.py for logits
+    # CRITICAL FIX: Use the SAME global attention_mask that was used for hidden states
+    # The mask is based on input_ids (before shift), so we apply it to targets (after shift)
+    # This ensures perfect mathematical alignment between logits and targets
     valid_targets = []
     
     for b in range(targets.size(0)):
@@ -52,9 +58,12 @@ def compute_loss_with_masking(
         # This matches the slicing in architecture.py: hidden_states[b, ctx_len-1:, :]
         completion_targets = targets[b, ctx_len-1:]
         
-        # Apply the same padding mask - only keep non-padded tokens
-        # NOTE: Padding token ID must match the value used in collate_fn
-        non_pad_mask = completion_targets != padding_token_id
+        # CRITICAL: Use the SAME mask from attention_mask
+        # attention_mask was computed from input_ids in collate_fn
+        # We apply it to completion_targets which come from target_ids (shifted input_ids)
+        completion_mask = attention_mask[b, ctx_len-1:]
+        non_pad_mask = completion_mask.bool()
+        
         if non_pad_mask.any():
             valid_targets.append(completion_targets[non_pad_mask])
     
@@ -117,6 +126,7 @@ def train_epoch(
         # Move batch to device
         input_ids = batch['input_ids'].to(device)
         target_ids = batch['target_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)  # CRITICAL: Get global mask
         ctx_lengths = batch['ctx_lengths']
         
         # Zero gradients
@@ -127,12 +137,12 @@ def train_epoch(
         # No gradient scaling needed - this is a key advantage of BF16
         with autocast(dtype=torch.bfloat16):
             # Get physically sliced logits (only for completion portion)
-            # CRITICAL FIX: Pass padding_token_id to ensure logits and targets are aligned
-            logits = model(input_ids, ctx_lengths=ctx_lengths, padding_token_id=0)
+            # CRITICAL FIX: Pass attention_mask to ensure logits and targets are aligned
+            logits = model(input_ids, ctx_lengths=ctx_lengths, attention_mask=attention_mask, padding_token_id=0)
             
-            # Compute loss with synchronized target slicing
+            # Compute loss with synchronized target slicing using the SAME global mask
             # Using padding_token_id=0 as defined in dataset.collate_fn
-            loss = compute_loss_with_masking(logits, target_ids, ctx_lengths, padding_token_id=0)
+            loss = compute_loss_with_masking(logits, target_ids, ctx_lengths, attention_mask, padding_token_id=0)
         
         # Backward pass - no scaling needed with BF16
         loss.backward()
