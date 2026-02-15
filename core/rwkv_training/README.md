@@ -1,25 +1,16 @@
-# RWKV v8 "Heron" with ROSA Training Model Integration
+# RWKV v8 "Heron" Training Model Integration
 
-This directory contains the training-capable RWKV v8 "Heron" model with **ROSA (Rapid Online Suffix Automaton)** extracted from the official [RWKV-LM](https://github.com/BlinkDL/RWKV-LM) repository.
+This directory contains the training-capable RWKV v8 "Heron" model extracted from the official [RWKV-LM](https://github.com/BlinkDL/RWKV-LM) repository.
 
-## RWKV v8 "Heron" with ROSA Architecture
+## RWKV v8 "Heron" Architecture
 
-RWKV v8 "Heron" is the latest RWKV architecture featuring:
-- ✅ **ROSA (Rapid Online Suffix Automaton)** - Revolutionary pattern matching mechanism
+RWKV v8 "Heron" is the latest stable RWKV architecture featuring:
 - ✅ WKV7s CUDA kernels (state-based) with full backward pass support
 - ✅ Improved attention mechanism with better long-context handling
 - ✅ Enhanced numerical stability and training efficiency
 - ✅ Optimized for modern GPUs (RTX 4090, etc.)
 
-### What is ROSA?
-
-**ROSA (Rapid Online Suffix Automaton)** is a groundbreaking innovation in RWKV v8 that:
-- 🚀 **Pattern Recognition:** Automatically discovers and exploits repeating patterns in sequences
-- 🚀 **Online Learning:** Updates suffix automaton structure in real-time during training
-- 🚀 **Memory Efficiency:** Compresses sequence representations using pattern matching
-- 🚀 **Copy & Count Abilities:** Achieves strong copying and counting capabilities with minimal parameters
-
-ROSA enables models to learn complex tasks (arithmetic, reversal, copying) with orders of magnitude fewer parameters than traditional transformers!
+**Key Innovation:** v8 introduces improvements to the time-mixing and channel-mixing mechanisms, with better state management and more efficient CUDA kernels.
 
 ## Why This is Necessary
 
@@ -37,9 +28,6 @@ The official RWKV-LM repository provides the full training implementation with:
 
 ### Model Files:
 - `rwkv_v8_model.py` - RWKV v8 "Heron" model implementation
-- `rosa_layer.py` - **ROSA (Rapid Online Suffix Automaton) layer implementation**
-- `rosa_train.py` - **ROSA training script with 1-bit quantization**
-- `rosa_lm.py` - **Pure ROSA language model (no RWKV, only ROSA + FFN)**
 - `__init__.py` - Package initialization
 
 ### CUDA Kernels (from RWKV-LM/RWKV-v7/cuda/):
@@ -48,30 +36,13 @@ The official RWKV-LM repository provides the full training implementation with:
 
 Note: v8 uses wkv7s kernels ("7s" = v7 with state management), which are optimized for RNN-mode inference and training.
 
-## Key Features of RWKV v8 with ROSA
-
-### ROSA (Rapid Online Suffix Automaton)
-
-**What ROSA Does:**
-ROSA is a suffix automaton that tracks repeating patterns in sequences and learns embeddings for them:
-
-1. **Pattern Discovery:** As the model processes tokens, ROSA builds a suffix automaton that identifies all repeating subsequences
-2. **Smart Embeddings:** Instead of traditional embeddings, ROSA uses pattern-based lookups:
-   - If a pattern has been seen before → use learned embedding for that pattern
-   - If pattern is new → use default embedding
-3. **1-bit Quantization:** ROSA can work with 1-bit (binary) representations, drastically reducing memory
-
-**Real-World Performance:**
-- **40K parameters** can reverse 60-digit numbers with 99.8% accuracy (v7 needs millions of params!)
-- **1M parameters** solve 40-digit arithmetic with 99% accuracy
-- **Pure ROSA model (L12)** trained only on 1.5B tokens achieves copy & count abilities
+## Key Features of RWKV v8
 
 ### Architecture Improvements
 - **Enhanced Time-Mixing:** Better attention mechanism with improved state propagation
 - **Optimized Channel-Mixing:** More efficient FFN with `enn.weight` for token-specific adaptations
 - **State Management:** Superior RNN-mode performance with efficient state updates
 - **Numerical Stability:** Improved training stability through better weight initialization
-- **ROSA Integration:** Suffix automaton for pattern-based sequence understanding
 
 ### Performance
 - Faster inference in RNN mode (O(1) per token)
@@ -80,8 +51,6 @@ ROSA is a suffix automaton that tracks repeating patterns in sequences and learn
 - Optimized for both GPT-mode (parallel) and RNN-mode (sequential)
 
 ## Usage
-
-### Standard RWKV v8 Model
 
 The model supports both RNN-mode (sequential, O(1) memory) and GPT-mode (parallel training):
 
@@ -97,46 +66,6 @@ output, state = model.forward_one(token_id, state)
 # GPT-mode (sequence at once, for training)
 output, state = model.forward_seq(token_ids, state, full_output=True)
 ```
-
-### ROSA Layer Integration
-
-Add ROSA pattern matching to your model:
-
-```python
-from core.rwkv_training.rosa_layer import ROSA_1bit_LAYER
-
-# Add ROSA layer to your architecture
-rosa_layer = ROSA_1bit_LAYER(n_embd, tau=1e-3)
-
-# Forward pass
-x = your_embeddings  # [B, T, C]
-rosa_output = rosa_layer(x)  # Pattern-based representation
-
-# ROSA automatically:
-# 1. Builds suffix automaton from input sequence
-# 2. Identifies repeating patterns
-# 3. Returns learned embeddings for seen patterns
-```
-
-### Pure ROSA Language Model
-
-Train a model using **only ROSA + FFN** (no RWKV attention):
-
-```python
-from core.rwkv_training.rosa_lm import ROSA_LM
-
-# This is a lightweight model that achieves surprising capabilities
-# with minimal parameters using pure pattern matching
-model = ROSA_LM(n_layer=12, n_embd=768)
-```
-
-### Music Generation with ROSA
-
-For music generation, ROSA is particularly powerful because:
-- **Melodic Patterns:** Music contains many repeating motifs, perfect for ROSA
-- **Chord Progressions:** Common chord sequences are automatically recognized
-- **Rhythm Patterns:** Repeating rhythmic structures are efficiently encoded
-- **Memory Efficiency:** 1-bit ROSA reduces memory, allowing longer sequences
 
 ## Requirements
 

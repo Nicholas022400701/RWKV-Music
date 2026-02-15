@@ -35,12 +35,11 @@ from core.rwkv_training.rwkv_v8_model import RWKV_x070  # ✅ v8 "Heron" with fu
 
 ## RWKV v8 "Heron" Architecture
 
-RWKV v8 is the **latest architecture** featuring:
+RWKV v8 is the **latest stable architecture** featuring:
 - ✅ Advanced WKV7s (state-based) CUDA kernels
 - ✅ Improved attention and FFN mechanisms
 - ✅ Better long-context handling
 - ✅ Enhanced numerical stability
-- ✅ Token-specific adaptations via `enn.weight`
 
 ## Prerequisites for Training
 
