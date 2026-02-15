@@ -99,6 +99,7 @@ class PianoMuseRWKV(nn.Module):
         self,
         input_ids: torch.Tensor,
         ctx_lengths: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         return_hidden: bool = False,
         padding_token_id: int = 0
     ) -> torch.Tensor:
@@ -108,7 +109,7 @@ class PianoMuseRWKV(nn.Module):
         During training (when ctx_lengths is provided):
         - Computes hidden states for full sequence using O(T) WKV kernel
         - Physically slices hidden states to remove context portion
-        - Filters out padding tokens to match target filtering
+        - Uses global attention_mask from collate_fn for alignment
         - Only projects completion portion through LM head
         - Reduces memory from [B, T, V] to [B, T_completion, V]
         
@@ -119,6 +120,8 @@ class PianoMuseRWKV(nn.Module):
             input_ids: Input token IDs [batch_size, seq_len]
             ctx_lengths: Length of context for each sequence [batch_size]
                         If provided, enables physical slicing for training
+            attention_mask: Global mask from collate_fn [batch_size, seq_len]
+                           1 for real tokens, 0 for padding (used for proper alignment)
             return_hidden: If True, return hidden states instead of logits
             padding_token_id: Token ID used for padding (default: 0)
         
@@ -149,7 +152,8 @@ class PianoMuseRWKV(nn.Module):
             
             # [TLA+ Re-design: Physical Slicing for Dimensionality Reduction]
             # NEVER send useless context hidden states to the massive LM head!
-            # CRITICAL FIX: Apply the same padding mask as used in loss computation
+            # CRITICAL FIX: Use global attention_mask from collate_fn for proper alignment
+            # This ensures hidden states and targets use the EXACT same mask
             
             valid_hiddens = []
             
@@ -162,10 +166,17 @@ class PianoMuseRWKV(nn.Module):
                 # We start from ctx_len-1 because targets are shifted by 1
                 completion_hidden = hidden_states[b, ctx_len-1:, :]
                 
-                # CRITICAL FIX: Apply padding mask to filter out padding tokens
-                # This must match the filtering done in train_parallel.py compute_loss_with_masking
-                completion_input_ids = input_ids[b, ctx_len-1:]
-                non_pad_mask = completion_input_ids != padding_token_id
+                # CRITICAL FIX: Use global attention_mask if provided, else fallback to padding check
+                # The mask must be based on input_ids, NOT target_ids, to match the hidden states
+                if attention_mask is not None:
+                    # Use the global mask from collate_fn (based on input_ids before shift)
+                    # This is the CORRECT way - mask generated once in collate_fn
+                    completion_mask = attention_mask[b, ctx_len-1:]
+                    non_pad_mask = completion_mask.bool()
+                else:
+                    # Fallback: compute mask from input_ids (not recommended, can cause misalignment)
+                    completion_input_ids = input_ids[b, ctx_len-1:]
+                    non_pad_mask = completion_input_ids != padding_token_id
                 
                 if non_pad_mask.any():
                     # Only keep non-padded hidden states

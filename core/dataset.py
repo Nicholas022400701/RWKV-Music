@@ -50,15 +50,43 @@ class CopilotDataset(Dataset):
         if self.max_seq_len is not None and len(full_seq) > self.max_seq_len:
             # Prioritize keeping completion, truncate context if necessary
             if len(comp_tokens) < self.max_seq_len:
-                ctx_tokens = ctx_tokens[-(self.max_seq_len - len(comp_tokens)):]
+                # CRITICAL FIX: Preserve metadata tokens (first 2 tokens: Tempo & TimeSignature)
+                # These are prepended in tokenization.py and must not be cut off
+                # Truncate from the middle, keeping first 2 tokens + end portion
+                new_ctx_len = self.max_seq_len - len(comp_tokens)
+                if len(ctx_tokens) > new_ctx_len and new_ctx_len >= 2:
+                    # Keep first 2 metadata tokens + tail portion
+                    metadata_tokens = ctx_tokens[:2]
+                    remaining_ctx = ctx_tokens[2:]
+                    # Calculate how many tokens to keep from remaining context
+                    keep_from_remaining = new_ctx_len - 2
+                    if keep_from_remaining > 0:
+                        ctx_tokens = metadata_tokens + remaining_ctx[-keep_from_remaining:]
+                    else:
+                        ctx_tokens = metadata_tokens
+                else:
+                    # Can fit entire context or context is too short
+                    ctx_tokens = ctx_tokens[-new_ctx_len:]
                 full_seq = ctx_tokens + comp_tokens
             else:
                 # Completion itself is extremely long - need to preserve minimum context
                 # Keep at least MIN_CONTEXT_RATIO (25%) of max_seq_len for context as an anchor point
                 # This ensures the model has some context to condition on
                 MIN_CONTEXT_RATIO = 0.25
-                keep_ctx = min(len(ctx_tokens), max(1, int(self.max_seq_len * MIN_CONTEXT_RATIO)))
-                ctx_tokens = ctx_tokens[-keep_ctx:]
+                keep_ctx = min(len(ctx_tokens), max(2, int(self.max_seq_len * MIN_CONTEXT_RATIO)))
+                # CRITICAL FIX: Always preserve first 2 metadata tokens
+                if len(ctx_tokens) >= 2 and keep_ctx >= 2:
+                    metadata_tokens = ctx_tokens[:2]
+                    if keep_ctx > 2:
+                        # Keep metadata + tail of context
+                        remaining_ctx = ctx_tokens[2:]
+                        ctx_tokens = metadata_tokens + remaining_ctx[-(keep_ctx - 2):]
+                    else:
+                        # Only keep metadata tokens
+                        ctx_tokens = metadata_tokens
+                else:
+                    # Fallback: keep last tokens if no metadata
+                    ctx_tokens = ctx_tokens[-keep_ctx:]
                 comp_tokens = comp_tokens[:self.max_seq_len - len(ctx_tokens)]
                 full_seq = ctx_tokens + comp_tokens
         
