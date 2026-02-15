@@ -82,7 +82,8 @@ class PianoMuseRWKV(nn.Module):
         self,
         input_ids: torch.Tensor,
         ctx_lengths: Optional[torch.Tensor] = None,
-        return_hidden: bool = False
+        return_hidden: bool = False,
+        padding_token_id: int = 0
     ) -> torch.Tensor:
         """
         Forward pass with physical logit slicing for memory efficiency.
@@ -90,6 +91,7 @@ class PianoMuseRWKV(nn.Module):
         During training (when ctx_lengths is provided):
         - Computes hidden states for full sequence using O(T) WKV kernel
         - Physically slices hidden states to remove context portion
+        - Filters out padding tokens to match target filtering
         - Only projects completion portion through LM head
         - Reduces memory from [B, T, V] to [B, T_completion, V]
         
@@ -101,6 +103,7 @@ class PianoMuseRWKV(nn.Module):
             ctx_lengths: Length of context for each sequence [batch_size]
                         If provided, enables physical slicing for training
             return_hidden: If True, return hidden states instead of logits
+            padding_token_id: Token ID used for padding (default: 0)
         
         Returns:
             If ctx_lengths provided: Logits only for completion portion [valid_tokens, vocab_size]
@@ -129,6 +132,7 @@ class PianoMuseRWKV(nn.Module):
             
             # [TLA+ Re-design: Physical Slicing for Dimensionality Reduction]
             # NEVER send useless context hidden states to the massive LM head!
+            # CRITICAL FIX: Apply the same padding mask as used in loss computation
             
             valid_hiddens = []
             
@@ -140,16 +144,30 @@ class PianoMuseRWKV(nn.Module):
                 # Extract completion hidden states (from context boundary to end)
                 # We start from ctx_len-1 because targets are shifted by 1
                 completion_hidden = hidden_states[b, ctx_len-1:, :]
-                valid_hiddens.append(completion_hidden)
+                
+                # CRITICAL FIX: Apply padding mask to filter out padding tokens
+                # This must match the filtering done in train_parallel.py compute_loss_with_masking
+                completion_input_ids = input_ids[b, ctx_len-1:]
+                non_pad_mask = completion_input_ids != padding_token_id
+                
+                if non_pad_mask.any():
+                    # Only keep non-padded hidden states
+                    completion_hidden = completion_hidden[non_pad_mask]
+                    valid_hiddens.append(completion_hidden)
             
             # Concatenate all valid hidden states into a single tensor
             # Collapses from [B, T, D] to [Valid_Tokens, D]
             # Memory usage drops from 10GB+ to ~1GB
+            if len(valid_hiddens) == 0:
+                # Edge case: no valid tokens (all padding)
+                # Return empty logits tensor
+                return torch.empty((0, self.vocab_size), device=input_ids.device, dtype=hidden_states.dtype)
+            
             valid_hiddens = torch.cat(valid_hiddens, dim=0)
             
             # Project to vocabulary space
             logits = self._project_to_vocab(valid_hiddens)
-            # Shape: [sum(seq_len - ctx_len) for each sequence, vocab_size]
+            # Shape: [sum(valid_completion_tokens), vocab_size]
             
             return logits
         

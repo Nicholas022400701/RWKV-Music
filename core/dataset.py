@@ -53,8 +53,12 @@ class CopilotDataset(Dataset):
                 ctx_tokens = ctx_tokens[-(self.max_seq_len - len(comp_tokens)):]
                 full_seq = ctx_tokens + comp_tokens
             else:
-                # Completion itself is too long, truncate it
-                full_seq = full_seq[:self.max_seq_len]
+                # Completion itself is extremely long - need to preserve minimum context
+                # Keep at least 1/4 of max_seq_len for context as an anchor point
+                keep_ctx = min(len(ctx_tokens), max(1, self.max_seq_len // 4))
+                ctx_tokens = ctx_tokens[-keep_ctx:]
+                comp_tokens = comp_tokens[:self.max_seq_len - len(ctx_tokens)]
+                full_seq = ctx_tokens + comp_tokens
         
         # CRITICAL FIX: ctx_len must reflect the ACTUAL length after truncation
         # to prevent IndexError when slicing hidden_states in architecture.py

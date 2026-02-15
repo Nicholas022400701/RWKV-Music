@@ -127,7 +127,8 @@ def train_epoch(
         # No gradient scaling needed - this is a key advantage of BF16
         with autocast(dtype=torch.bfloat16):
             # Get physically sliced logits (only for completion portion)
-            logits = model(input_ids, ctx_lengths=ctx_lengths)
+            # CRITICAL FIX: Pass padding_token_id to ensure logits and targets are aligned
+            logits = model(input_ids, ctx_lengths=ctx_lengths, padding_token_id=0)
             
             # Compute loss with synchronized target slicing
             # Using padding_token_id=0 as defined in dataset.collate_fn
