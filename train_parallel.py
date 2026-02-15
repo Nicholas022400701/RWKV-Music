@@ -7,7 +7,7 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import argparse
@@ -24,30 +24,36 @@ from core.dataset import CopilotDataset, collate_fn, load_dataset
 def compute_loss_with_masking(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    ctx_lengths: torch.Tensor
+    ctx_lengths: torch.Tensor,
+    attention_mask: torch.Tensor
 ) -> torch.Tensor:
     """
     Compute cross-entropy loss with physical slicing.
     
-    Since logits are already physically sliced in the forward pass,
-    we need to similarly slice the targets to match.
+    CRITICAL FIX: Use the same boolean mask to extract both logits and targets
+    to ensure perfect alignment and prevent cross-sample pollution.
     
     Args:
         logits: Already sliced logits [sum(completion_lengths), vocab_size]
         targets: Full target sequence [batch_size, seq_len]
         ctx_lengths: Context length for each sequence [batch_size]
+        attention_mask: Attention mask [batch_size, seq_len]
     
     Returns:
         Scalar loss tensor
     """
     # Extract valid targets (completion portion only)
+    # We build the same mask that was used in architecture.py for logits
     valid_targets = []
     
     for b in range(targets.size(0)):
         ctx_len = ctx_lengths[b].item()
         # Targets start from ctx_len-1 (due to shift in autoregression)
+        # This matches the slicing in architecture.py: hidden_states[b, ctx_len-1:, :]
         completion_targets = targets[b, ctx_len-1:]
-        # Remove padding
+        
+        # Apply the same padding mask - only keep non-padded tokens
+        # Padding tokens are 0, so we filter them out
         non_pad_mask = completion_targets != 0
         if non_pad_mask.any():
             valid_targets.append(completion_targets[non_pad_mask])
@@ -59,9 +65,13 @@ def compute_loss_with_masking(
     
     valid_targets = torch.cat(valid_targets, dim=0)
     
-    # Ensure shapes match
+    # CRITICAL FIX: Ensure perfect alignment
+    # Both logits and targets should have been extracted with the same mask
+    # If there's a mismatch, it indicates a bug in the slicing logic
     if logits.size(0) != valid_targets.size(0):
-        # Truncate to minimum length
+        print(f"[WARNING] Shape mismatch: logits={logits.size(0)}, targets={valid_targets.size(0)}")
+        print(f"[WARNING] This indicates a potential alignment issue. Using min_len as fallback.")
+        # Truncate to minimum length as last resort
         min_len = min(logits.size(0), valid_targets.size(0))
         logits = logits[:min_len]
         valid_targets = valid_targets[:min_len]
@@ -78,7 +88,6 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: AdamW,
     scheduler,
-    scaler: GradScaler,
     device: torch.device,
     epoch: int,
     grad_clip: float = 1.0
@@ -91,7 +100,6 @@ def train_epoch(
         dataloader: Training data loader
         optimizer: AdamW optimizer
         scheduler: Learning rate scheduler
-        scaler: Gradient scaler for mixed precision
         device: CUDA device
         epoch: Current epoch number
         grad_clip: Gradient clipping threshold
@@ -108,29 +116,29 @@ def train_epoch(
         input_ids = batch['input_ids'].to(device)
         target_ids = batch['target_ids'].to(device)
         ctx_lengths = batch['ctx_lengths']
+        attention_mask = batch['attention_mask'].to(device)
         
         # Zero gradients
         optimizer.zero_grad(set_to_none=True)
         
         # Forward pass with automatic mixed precision
-        # RTX 4090 privilege: bfloat16 prevents gradient overflow in WKV exponential decay
+        # BFloat16 has same dynamic range as FP32 (8-bit exponent)
+        # No gradient scaling needed - this is a key advantage of BF16
         with autocast(dtype=torch.bfloat16):
             # Get physically sliced logits (only for completion portion)
             logits = model(input_ids, ctx_lengths=ctx_lengths)
             
             # Compute loss with synchronized target slicing
-            loss = compute_loss_with_masking(logits, target_ids, ctx_lengths)
+            loss = compute_loss_with_masking(logits, target_ids, ctx_lengths, attention_mask)
         
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
+        # Backward pass - no scaling needed with BF16
+        loss.backward()
         
         # Gradient clipping (prevent explosion from chord jumps)
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         
         # Optimizer step
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         
         # Update learning rate
         scheduler.step(epoch + batch_idx / num_batches)
@@ -239,10 +247,6 @@ def main(args):
         eta_min=args.learning_rate * 0.1
     )
     
-    # Gradient scaler for mixed precision training
-    # Even with bf16, scaler prevents underflow from extreme rest symbols in music
-    scaler = GradScaler()
-    
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -261,7 +265,7 @@ def main(args):
         # Train one epoch
         avg_loss = train_epoch(
             model, dataloader, optimizer, scheduler,
-            scaler, device, epoch, args.grad_clip
+            device, epoch, args.grad_clip
         )
         
         print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")

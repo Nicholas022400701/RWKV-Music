@@ -61,11 +61,24 @@ def hijack_windows_cuda_env():
         # Force enable RWKV custom CUDA kernels
         os.environ["RWKV_CUDA_ON"] = "1"
         
-        # Lock to RTX 4090 architecture (compute capability 8.9)
-        os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
+        # Dynamically detect GPU compute capability instead of hardcoding
+        # This ensures compatibility across different GPU architectures
+        try:
+            import torch
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability(0)
+                compute_capability = f"{major}.{minor}"
+                os.environ["TORCH_CUDA_ARCH_LIST"] = compute_capability
+                print(f"[Genius System] Detected GPU compute capability: {compute_capability}")
+            else:
+                print("[Warning] CUDA not available, skipping architecture detection")
+        except Exception as e:
+            print(f"[Warning] Failed to detect GPU architecture: {e}")
+            # Fallback to a reasonable default
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;8.9"
         
         print("[Genius System] MSVC compiler hijacked successfully.")
-        print("[Genius System] RWKV CUDA kernels enabled for RTX 4090 (compute 8.9).")
+        print("[Genius System] RWKV CUDA kernels enabled.")
         
     except Exception as e:
         print(f"\n[ERROR] Failed to hijack MSVC environment: {e}", file=sys.stderr)
