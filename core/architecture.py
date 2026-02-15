@@ -328,7 +328,18 @@ class PianoMuseRWKV(nn.Module):
         return hidden_states
     
     def _simple_time_mix(self, x: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """Simplified time mixing without full WKV for compatibility."""
+        """
+        Simplified time mixing without full WKV for compatibility.
+        
+        WARNING: This is a placeholder implementation that does NOT match RWKV's actual
+        time mixing behavior. The real RWKV uses a custom WKV (Weighted Key-Value) operator
+        with state tracking and exponential decay, which is much more sophisticated.
+        
+        This simplified version should NOT be used for training as it will produce
+        incorrect results. It exists only for basic API compatibility testing.
+        
+        For proper training, use the full RWKV-LM model with wkv_cuda operators.
+        """
         # This is a placeholder - proper implementation requires the full WKV operator
         # For now, just use linear projections as approximation
         att = f'blocks.{layer_id}.att.'
@@ -345,7 +356,7 @@ class PianoMuseRWKV(nn.Module):
         
         return out
     
-    def _simple_channel_mix(self, x: torch.Tensor, layer_id: int, seq: list) -> torch.Tensor:
+    def _simple_channel_mix(self, x: torch.Tensor, layer_id: int, token_ids: list) -> torch.Tensor:
         """Simplified channel mixing."""
         ffn = f'blocks.{layer_id}.ffn.'
         
@@ -354,11 +365,11 @@ class PianoMuseRWKV(nn.Module):
         v = k @ self.model.z[ffn+'value.weight'].T
         
         # Element-wise multiplication with ENN weights
-        # Note: seq indexing may not work for batch, using first token as fallback
+        # Note: token_ids indexing may not work for batch, using first token as fallback
         try:
-            enn = self.model.z[ffn+'enn.weight'][seq]
-        except:
-            # Fallback if indexing fails
+            enn = self.model.z[ffn+'enn.weight'][token_ids]
+        except (KeyError, IndexError, TypeError):
+            # Fallback if indexing fails - use ones
             enn = torch.ones_like(v)
         
         return v * enn

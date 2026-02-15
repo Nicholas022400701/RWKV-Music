@@ -21,7 +21,7 @@ This document summarizes the critical bugs identified in the problem statement a
 - `core/architecture.py`: Lines 81-182 (forward method with padding filter)
 - `train_parallel.py`: Line 130 (pass padding_token_id parameter)
 
-**Validation**: Test confirms logits and targets now have matching dimensions (160 tokens in test case).
+**Validation**: Test confirms logits and targets now have matching dimensions for all test cases.
 
 ---
 
@@ -134,7 +134,7 @@ load(name="wkv7s", sources=[f"{cuda_dir}/wkv7s_op.cpp", f"{cuda_dir}/wkv7s.cu"],
 All critical fixes have been validated:
 
 ### test_critical_alignment.py
-- ✓ Mask Alignment: Logits and targets match (160 tokens each)
+- ✓ Mask Alignment: Logits and targets match for all test cases
 - ✓ Dataset Truncation: ctx_len stays within bounds
 - ✓ JIT Path Fix: Absolute paths used
 - ✓ Backward Stub: NotImplementedError present

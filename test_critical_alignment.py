@@ -27,11 +27,12 @@ def test_mask_alignment():
     print("=" * 70)
     
     # Create mock data with varying lengths to trigger padding
+    # Using distinct ranges for clarity: context uses 1000+ range, completion uses 2000+ range
     test_data = [
-        {'context': list(range(1, 51)), 'completion': list(range(51, 101))},  # 50+50=100 tokens
-        {'context': list(range(1, 31)), 'completion': list(range(31, 61))},   # 30+30=60 tokens
-        {'context': list(range(1, 41)), 'completion': list(range(41, 91))},   # 40+50=90 tokens
-        {'context': list(range(1, 21)), 'completion': list(range(21, 51))},   # 20+30=50 tokens
+        {'context': list(range(1000, 1050)), 'completion': list(range(2000, 2050))},  # 50+50=100 tokens
+        {'context': list(range(1000, 1030)), 'completion': list(range(2000, 2030))},  # 30+30=60 tokens
+        {'context': list(range(1000, 1040)), 'completion': list(range(2000, 2050))},  # 40+50=90 tokens
+        {'context': list(range(1000, 1020)), 'completion': list(range(2000, 2030))},  # 20+30=50 tokens
     ]
     
     dataset = CopilotDataset(test_data, max_seq_len=128)
