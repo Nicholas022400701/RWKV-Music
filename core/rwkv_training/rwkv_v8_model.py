@@ -62,11 +62,19 @@ DTYPE = torch.half
 from torch.utils.cpp_extension import load
 HEAD_SIZE = args.head_size
 
-load(name="wkv7s", sources=["cuda/wkv7s_op.cpp", f"cuda/wkv7s.cu"], is_python_module=False,
+# CRITICAL FIX: Use absolute paths for CUDA kernel compilation
+# Relative paths fail when script is run from different directories
+import os
+cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
+load(name="wkv7s", sources=[f"{cuda_dir}/wkv7s_op.cpp", f"{cuda_dir}/wkv7s.cu"], is_python_module=False,
                     verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"])
+
 class WKV_7(torch.autograd.Function):
     @staticmethod
     def forward(ctx, state, r, w, k, v, a, b):
+        # CRITICAL WARNING: This implementation wraps forward in torch.no_grad()
+        # which breaks gradient computation. For training, a proper backward
+        # implementation is required. This is only suitable for inference.
         with torch.no_grad():
             T, C = r.size()
             H = C // HEAD_SIZE
@@ -77,6 +85,18 @@ class WKV_7(torch.autograd.Function):
             y = torch.empty((T, C), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
             torch.ops.wkv7s.forward(1, T, C, H, state, r, w, k, v, a, b, y)
             return y
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # NOTE: Backward pass is not implemented in this version
+        # For training, you need the full RWKV-LM training model with wkv_cuda_backward
+        raise NotImplementedError(
+            "Backward pass is not implemented for WKV_7 operator. "
+            "This model is inference-only. For training, use the full RWKV-LM "
+            "training model from https://github.com/BlinkDL/RWKV-LM which includes "
+            "the wkv_cuda_backward operator."
+        )
+
 def RWKV7_OP(state, r, w, k, v, a, b):
     return WKV_7.apply(state, r, w, k, v, a, b)
 
