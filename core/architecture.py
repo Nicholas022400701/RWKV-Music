@@ -40,28 +40,26 @@ class PianoMuseRWKV(nn.Module):
         # The inference-only 'rwkv' package lacks backward pass support
         # We need the full training model from RWKV-LM with wkv_cuda_backward
         try:
-            # Option 1: Try to use training-capable RWKV model from pip package
-            # This requires the full RWKV package with training support
-            from rwkv.model import RWKV
-            self.rwkv_lib = RWKV
-            self.using_training_model = True
-            print("[Model] Using RWKV pip package")
+            # Option 1: Try the v8 model included in core/rwkv_training/
+            # This is from RWKV-LM and supports training with backward pass
+            from core.rwkv_training.rwkv_v8_model import RWKV_x070
+            self.rwkv_lib = RWKV_x070
+            self.using_training_model = True  # FIXED: This IS the training model
+            print("[Model] Using RWKV_x070 v8 Heron training model from core/rwkv_training/")
         except ImportError:
-            # Option 2: Try the v8 model included in core/rwkv_training/
+            # Option 2: Fall back to pip package (inference-only)
             # NOTE: This is inference-only and lacks proper training support
             try:
-                from core.rwkv_training.rwkv_v8_model import RWKV_x070
-                self.rwkv_lib = RWKV_x070
-                self.using_training_model = False
-                print("[WARNING] Using inference-only RWKV_x070 model - training will FAIL!")
+                from rwkv.model import RWKV
+                self.rwkv_lib = RWKV
+                self.using_training_model = False  # FIXED: pip package is inference-only
+                print("[WARNING] Using inference-only RWKV pip package - training will FAIL!")
                 print("[WARNING] Backward pass is not supported by this model.")
-                print("[WARNING] For training, install: pip install rwkv")
-                print("[WARNING] Or use the full training model from https://github.com/BlinkDL/RWKV-LM")
+                print("[WARNING] For training, use the full training model from core/rwkv_training/")
             except ImportError:
                 raise ImportError(
-                    "RWKV model not found. Please install the RWKV package: pip install rwkv\n"
-                    "Or ensure core/rwkv_training/ contains the training model from "
-                    "https://github.com/BlinkDL/RWKV-LM"
+                    "RWKV model not found. Please ensure core/rwkv_training/ contains "
+                    "the training model from https://github.com/BlinkDL/RWKV-LM"
                 )
         
         # Load pretrained RWKV model
@@ -71,13 +69,7 @@ class PianoMuseRWKV(nn.Module):
         
         # Handle different model APIs
         if self.using_training_model:
-            # Standard RWKV pip package API
-            self.model = self.rwkv_lib(model=model_path, strategy=strategy)
-            self.n_embd = self.model.args.n_embd
-            self.n_layer = self.model.args.n_layer
-            self.vocab_size = self.model.args.vocab_size
-        else:
-            # RWKV_x070 has different API - needs args object
+            # RWKV_x070 training model - needs args object
             import types
             model_args = types.SimpleNamespace()
             model_args.MODEL_NAME = model_path.replace('.pth', '') if model_path.endswith('.pth') else model_path
@@ -91,6 +83,12 @@ class PianoMuseRWKV(nn.Module):
             self.n_embd = self.model.n_embd
             self.n_layer = self.model.n_layer
             self.vocab_size = model_args.vocab_size
+        else:
+            # Inference-only RWKV pip package API (fallback)
+            self.model = self.rwkv_lib(model=model_path, strategy=strategy)
+            self.n_embd = self.model.args.n_embd
+            self.n_layer = self.model.args.n_layer
+            self.vocab_size = self.model.args.vocab_size
         
         print(f"[Model] Model loaded successfully with strategy: {strategy}")
         
@@ -214,11 +212,11 @@ class PianoMuseRWKV(nn.Module):
         
         # Handle different model types
         if self.using_training_model:
-            # Standard RWKV pip package with self.model.w structure
-            return self._get_hidden_states_standard(input_ids)
-        else:
-            # RWKV_x070 with self.model.z structure
+            # RWKV_x070 training model with self.model.z structure
             return self._get_hidden_states_v8(input_ids)
+        else:
+            # Standard RWKV pip package with self.model.w structure (inference-only fallback)
+            return self._get_hidden_states_standard(input_ids)
     
     def _get_hidden_states_standard(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Get hidden states using standard RWKV pip package."""
@@ -444,11 +442,11 @@ class PianoMuseRWKV(nn.Module):
         """
         # Use the LM head from RWKV model - handle different model structures
         if self.using_training_model:
-            # Standard RWKV pip package: self.model.w.head.weight
-            logits = torch.matmul(hidden, self.model.w.head.weight.T)
-        else:
-            # RWKV_x070: self.model.z['head.weight']
+            # RWKV_x070 training model: self.model.z['head.weight']
             logits = torch.matmul(hidden, self.model.z['head.weight'].T)
+        else:
+            # Standard RWKV pip package: self.model.w.head.weight (inference-only fallback)
+            logits = torch.matmul(hidden, self.model.w.head.weight.T)
         return logits
     
     def generate(
