@@ -56,6 +56,8 @@ class CopilotDataset(Dataset):
                 # Completion itself is too long, truncate it
                 full_seq = full_seq[:self.max_seq_len]
         
+        # CRITICAL FIX: ctx_len must reflect the ACTUAL length after truncation
+        # to prevent IndexError when slicing hidden_states in architecture.py
         ctx_len = len(ctx_tokens)
         
         # Create input and target sequences (shifted by 1 for autoregression)

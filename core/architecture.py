@@ -1,6 +1,12 @@
 """
 RWKV Architecture Wrapper with Logit Physical Slicing.
 Implements memory-efficient forward pass by slicing hidden states before LM head.
+
+CRITICAL: This module requires the training-capable RWKV model from core/rwkv_training/
+which includes backward pass support. The inference-only 'rwkv' pip package CANNOT be used
+for training as it lacks gradient computation through WKV operators.
+
+The training model is extracted from: https://github.com/BlinkDL/RWKV-LM
 """
 
 import torch
@@ -30,14 +36,32 @@ class PianoMuseRWKV(nn.Module):
         """
         super().__init__()
         
+        # CRITICAL FIX: Use training-capable RWKV model, not inference-only pip package
+        # The inference-only 'rwkv' package lacks backward pass support
+        # We need the full training model from RWKV-LM with wkv_cuda_backward
         try:
-            from rwkv.model import RWKV
-            self.rwkv_lib = RWKV
+            # Option 1: Use the training model included in core/rwkv_training/
+            # This is the correct approach for training
+            from core.rwkv_training.model import RWKV as RWKVTraining
+            self.rwkv_lib = RWKVTraining
+            self.using_training_model = True
+            print("[Model] Using training-capable RWKV model with backward pass support")
         except ImportError:
-            raise ImportError(
-                "RWKV library not installed. "
-                "Install from: https://github.com/BlinkDL/RWKV-LM"
-            )
+            # Option 2: Fallback to inference-only package (will fail during backward)
+            # This is only for inference/testing, NOT for training
+            try:
+                from rwkv.model import RWKV
+                self.rwkv_lib = RWKV
+                self.using_training_model = False
+                print("[WARNING] Using inference-only RWKV model - training will FAIL!")
+                print("[WARNING] Backward pass is not supported by the inference-only package.")
+                print("[WARNING] Please use the training model from core/rwkv_training/")
+            except ImportError:
+                raise ImportError(
+                    "RWKV model not found. Please ensure core/rwkv_training/ contains "
+                    "the training model from https://github.com/BlinkDL/RWKV-LM "
+                    "or install the inference-only package: pip install rwkv"
+                )
         
         # Load pretrained RWKV model
         # Recommended: 1.5B-3B params with "deep and narrow" architecture
@@ -94,6 +118,15 @@ class PianoMuseRWKV(nn.Module):
         
         # Training mode with loss masking: physically slice hidden states
         if self.training and ctx_lengths is not None:
+            # CRITICAL: Verify we're using the training-capable model
+            if not self.using_training_model:
+                raise RuntimeError(
+                    "Cannot train with inference-only RWKV model! "
+                    "The inference-only 'rwkv' pip package does not support backward pass. "
+                    "Please use the training model from core/rwkv_training/ which includes "
+                    "wkv_cuda_backward operators from https://github.com/BlinkDL/RWKV-LM"
+                )
+            
             # [TLA+ Re-design: Physical Slicing for Dimensionality Reduction]
             # NEVER send useless context hidden states to the massive LM head!
             
@@ -142,74 +175,108 @@ class PianoMuseRWKV(nn.Module):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # Initialize state (None for parallel mode)
-        # RWKV will use parallel WKV computation during training
+        # Process batch using RWKV library's forward method
+        # This properly handles WKV computation with gradients for training
         hidden_states = []
         
         for b in range(batch_size):
             # Process each sequence in batch
             seq = input_ids[b].cpu().tolist()  # RWKV expects Python list
             
-            # Get embeddings and run through layers
-            # This triggers the WKV CUDA kernel for O(T) parallel computation
-            x = self.model.w.emb.weight[seq]  # [seq_len, n_embd]
+            # Get embeddings and process through layers manually to extract hidden states
+            x = self.model.w.emb.weight[seq].to(device)  # [seq_len, n_embd]
             
-            # Run through RWKV blocks
-            for block in self.model.w.blocks:
-                x = self._forward_block(x, block)
+            # Apply layer normalization before blocks
+            if hasattr(self.model.w, 'ln0'):
+                x = torch.nn.functional.layer_norm(
+                    x, (self.n_embd,), weight=self.model.w.ln0.weight, bias=self.model.w.ln0.bias
+                )
+            
+            # Process through blocks - use the model's actual forward logic
+            # For training mode, we need gradient-enabled operations
+            for i, block in enumerate(self.model.w.blocks):
+                # Use the actual block forward if available
+                # Note: RWKV blocks handle residual connections internally
+                if hasattr(block, 'forward'):
+                    x = block.forward(x, None)
+                else:
+                    # Fallback: use RWKV's built-in operations
+                    # Time mixing (attention)
+                    if hasattr(block, 'att'):
+                        att_output = self._compute_att_output(x, block)
+                        x = x + att_output
+                    # Channel mixing (FFN)
+                    if hasattr(block, 'ffn'):
+                        ffn_output = self._compute_ffn_output(x, block)
+                        x = x + ffn_output
+            
+            # Final layer norm
+            x = torch.nn.functional.layer_norm(
+                x, (self.n_embd,), weight=self.model.w.ln_out.weight, bias=self.model.w.ln_out.bias
+            )
             
             hidden_states.append(x)
         
         # Stack batch
         hidden_states = torch.stack(hidden_states, dim=0)
-        return hidden_states.to(device)
+        return hidden_states
     
-    def _forward_block(self, x: torch.Tensor, block) -> torch.Tensor:
+    def _compute_att_output(self, x: torch.Tensor, block) -> torch.Tensor:
         """
-        Forward pass through a single RWKV block.
+        Compute attention (time mixing) output.
+        Uses RWKV's WKV mechanism with gradient support.
         
         Args:
             x: Input tensor [seq_len, n_embd]
             block: RWKV block object
         
         Returns:
-            Output tensor [seq_len, n_embd]
+            Attention output [seq_len, n_embd]
         """
-        # Time mixing (attention mechanism)
-        x = x + self._time_mixing(self._layer_norm(x, block.ln1), block.att)
+        # Apply layer norm
+        x_norm = torch.nn.functional.layer_norm(
+            x, (self.n_embd,), weight=block.ln1.weight, bias=block.ln1.bias
+        )
         
-        # Channel mixing (feedforward)
-        x = x + self._channel_mixing(self._layer_norm(x, block.ln2), block.ffn)
+        # Use RWKV's built-in attention computation if available
+        # The att module should have a forward method that handles WKV
+        if hasattr(block.att, 'forward'):
+            return block.att.forward(x_norm, None)
         
-        return x
-    
-    def _layer_norm(self, x: torch.Tensor, ln) -> torch.Tensor:
-        """Apply layer normalization."""
-        return torch.nn.functional.layer_norm(
-            x, (self.n_embd,), weight=ln.weight, bias=ln.bias
+        # Fallback should not be reached with proper RWKV library
+        raise RuntimeError(
+            "RWKV attention (time mixing) module is incompatible. "
+            "The module does not have a forward method, indicating an incompatible RWKV library version. "
+            "Please ensure you're using the training-capable model from core/rwkv_training/ "
+            "or the correct RWKV library version with training support."
         )
     
-    def _time_mixing(self, x: torch.Tensor, att) -> torch.Tensor:
+    def _compute_ffn_output(self, x: torch.Tensor, block) -> torch.Tensor:
         """
-        Time mixing (WKV attention mechanism).
-        This is where the magic O(T) parallel computation happens.
-        """
-        # This is a simplified version - actual RWKV uses custom CUDA kernels
-        # For production, rely on the rwkv library's implementation
-        # which handles WKV computation efficiently
+        Compute feedforward (channel mixing) output.
         
-        # Placeholder - actual implementation in rwkv library
-        raise NotImplementedError(
-            "This is a simplified architecture wrapper. "
-            "Use the actual RWKV library for full implementation."
+        Args:
+            x: Input tensor [seq_len, n_embd]
+            block: RWKV block object
+        
+        Returns:
+            FFN output [seq_len, n_embd]
+        """
+        # Apply layer norm
+        x_norm = torch.nn.functional.layer_norm(
+            x, (self.n_embd,), weight=block.ln2.weight, bias=block.ln2.bias
         )
-    
-    def _channel_mixing(self, x: torch.Tensor, ffn) -> torch.Tensor:
-        """Channel mixing (feedforward network)."""
-        # Placeholder - actual implementation in rwkv library
-        raise NotImplementedError(
-            "This is a simplified architecture wrapper. "
-            "Use the actual RWKV library for full implementation."
+        
+        # Use RWKV's built-in FFN computation if available
+        if hasattr(block.ffn, 'forward'):
+            return block.ffn.forward(x_norm)
+        
+        # Fallback should not be reached with proper RWKV library
+        raise RuntimeError(
+            "RWKV FFN (channel mixing) module is incompatible. "
+            "The module does not have a forward method, indicating an incompatible RWKV library version. "
+            "Please ensure you're using the training-capable model from core/rwkv_training/ "
+            "or the correct RWKV library version with training support."
         )
     
     def _project_to_vocab(self, hidden: torch.Tensor) -> torch.Tensor:
