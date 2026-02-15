@@ -203,22 +203,28 @@ def test_alignment_improvements():
     if 'CRITICAL FIX' in source or 'perfect alignment' in source.lower():
         improvements.append("Alignment fix documented in code")
     
-    # Check for warning when mismatch detected
-    if 'Shape mismatch' in source or 'shape mismatch' in source:
-        improvements.append("Shape mismatch warning added")
+    # Check for error handling when mismatch detected (should raise exception)
+    if 'RuntimeError' in source and 'ALIGNMENT ERROR' in source:
+        improvements.append("Strict alignment error checking with exception")
+    elif 'Shape mismatch' in source or 'shape mismatch' in source:
+        improvements.append("Shape mismatch detection present")
     
     # Check that the same mask is mentioned
     if 'same' in source.lower() and 'mask' in source.lower():
         improvements.append("Documentation mentions using same mask")
     
-    if len(improvements) >= 2:
+    # Check padding token assumption is documented
+    if 'ASSUMPTION' in source and 'Padding' in source:
+        improvements.append("Padding token assumption documented")
+    
+    if len(improvements) >= 3:
         print("✓ PASS: Alignment improvements implemented")
         for imp in improvements:
             print(f"  - {imp}")
         return True
     else:
         print("✗ FAIL: Insufficient alignment improvements")
-        print(f"  Found {len(improvements)} improvements, expected at least 2")
+        print(f"  Found {len(improvements)} improvements, expected at least 3")
         return False
 
 

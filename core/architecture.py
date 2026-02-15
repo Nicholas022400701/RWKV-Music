@@ -150,15 +150,6 @@ class PianoMuseRWKV(nn.Module):
             # Process each sequence in batch
             seq = input_ids[b].cpu().tolist()  # RWKV expects Python list
             
-            # Use RWKV library's forward method which properly handles:
-            # 1. Embedding lookup
-            # 2. WKV computation with gradient support
-            # 3. All layer operations
-            # State=None enables parallel mode with gradient computation
-            out, _ = self.model.forward(seq, None)
-            
-            # out is the logits, we need to extract hidden states before final projection
-            # For training, we need embeddings and layer outputs, not just logits
             # Get embeddings and process through layers manually to extract hidden states
             x = self.model.w.emb.weight[seq].to(device)  # [seq_len, n_embd]
             
@@ -218,9 +209,14 @@ class PianoMuseRWKV(nn.Module):
         if hasattr(block.att, 'forward'):
             return block.att.forward(x_norm, None)
         
-        # Fallback: return zero to at least allow forward pass
-        # This should ideally never be reached with proper RWKV library
-        return torch.zeros_like(x)
+        # Fallback should not be reached with proper RWKV library
+        # Log warning and raise exception to prevent silent failures
+        import warnings
+        warnings.warn("RWKV attention module does not have forward method. This indicates an incompatible RWKV library version.")
+        raise RuntimeError(
+            "RWKV attention (time mixing) module is incompatible. "
+            "Please ensure you're using the correct RWKV library version with training support."
+        )
     
     def _compute_ffn_output(self, x: torch.Tensor, block) -> torch.Tensor:
         """
@@ -242,8 +238,14 @@ class PianoMuseRWKV(nn.Module):
         if hasattr(block.ffn, 'forward'):
             return block.ffn.forward(x_norm)
         
-        # Fallback: return zero to at least allow forward pass
-        return torch.zeros_like(x)
+        # Fallback should not be reached with proper RWKV library
+        # Log warning and raise exception to prevent silent failures
+        import warnings
+        warnings.warn("RWKV FFN module does not have forward method. This indicates an incompatible RWKV library version.")
+        raise RuntimeError(
+            "RWKV FFN (channel mixing) module is incompatible. "
+            "Please ensure you're using the correct RWKV library version with training support."
+        )
     
     def _project_to_vocab(self, hidden: torch.Tensor) -> torch.Tensor:
         """

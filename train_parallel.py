@@ -53,7 +53,8 @@ def compute_loss_with_masking(
         completion_targets = targets[b, ctx_len-1:]
         
         # Apply the same padding mask - only keep non-padded tokens
-        # Padding tokens are 0, so we filter them out
+        # ASSUMPTION: Padding tokens are 0 (as defined in collate_fn in dataset.py)
+        # This should match the tokenization scheme used throughout the codebase
         non_pad_mask = completion_targets != 0
         if non_pad_mask.any():
             valid_targets.append(completion_targets[non_pad_mask])
@@ -69,12 +70,14 @@ def compute_loss_with_masking(
     # Both logits and targets should have been extracted with the same mask
     # If there's a mismatch, it indicates a bug in the slicing logic
     if logits.size(0) != valid_targets.size(0):
-        print(f"[WARNING] Shape mismatch: logits={logits.size(0)}, targets={valid_targets.size(0)}")
-        print(f"[WARNING] This indicates a potential alignment issue. Using min_len as fallback.")
-        # Truncate to minimum length as last resort
-        min_len = min(logits.size(0), valid_targets.size(0))
-        logits = logits[:min_len]
-        valid_targets = valid_targets[:min_len]
+        error_msg = (
+            f"CRITICAL ALIGNMENT ERROR: Shape mismatch detected!\n"
+            f"  Logits shape: {logits.size(0)}\n"
+            f"  Targets shape: {valid_targets.size(0)}\n"
+            f"This indicates a serious bug in the slicing logic that would corrupt training.\n"
+            f"Training cannot continue with misaligned data."
+        )
+        raise RuntimeError(error_msg)
     
     # Compute cross-entropy loss
     # 100% of compute power focused on completion prediction
