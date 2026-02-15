@@ -1,6 +1,12 @@
 """
 RWKV Architecture Wrapper with Logit Physical Slicing.
 Implements memory-efficient forward pass by slicing hidden states before LM head.
+
+CRITICAL: This module requires the training-capable RWKV model from core/rwkv_training/
+which includes backward pass support. The inference-only 'rwkv' pip package CANNOT be used
+for training as it lacks gradient computation through WKV operators.
+
+The training model is extracted from: https://github.com/BlinkDL/RWKV-LM
 """
 
 import torch
@@ -30,14 +36,32 @@ class PianoMuseRWKV(nn.Module):
         """
         super().__init__()
         
+        # CRITICAL FIX: Use training-capable RWKV model, not inference-only pip package
+        # The inference-only 'rwkv' package lacks backward pass support
+        # We need the full training model from RWKV-LM with wkv_cuda_backward
         try:
-            from rwkv.model import RWKV
-            self.rwkv_lib = RWKV
+            # Option 1: Use the training model included in core/rwkv_training/
+            # This is the correct approach for training
+            from core.rwkv_training.model import RWKV as RWKVTraining
+            self.rwkv_lib = RWKVTraining
+            self.using_training_model = True
+            print("[Model] Using training-capable RWKV model with backward pass support")
         except ImportError:
-            raise ImportError(
-                "RWKV library not installed. "
-                "Install from: https://github.com/BlinkDL/RWKV-LM"
-            )
+            # Option 2: Fallback to inference-only package (will fail during backward)
+            # This is only for inference/testing, NOT for training
+            try:
+                from rwkv.model import RWKV
+                self.rwkv_lib = RWKV
+                self.using_training_model = False
+                print("[WARNING] Using inference-only RWKV model - training will FAIL!")
+                print("[WARNING] Backward pass is not supported by the inference-only package.")
+                print("[WARNING] Please use the training model from core/rwkv_training/")
+            except ImportError:
+                raise ImportError(
+                    "RWKV model not found. Please ensure core/rwkv_training/ contains "
+                    "the training model from https://github.com/BlinkDL/RWKV-LM "
+                    "or install the inference-only package: pip install rwkv"
+                )
         
         # Load pretrained RWKV model
         # Recommended: 1.5B-3B params with "deep and narrow" architecture
@@ -94,6 +118,15 @@ class PianoMuseRWKV(nn.Module):
         
         # Training mode with loss masking: physically slice hidden states
         if self.training and ctx_lengths is not None:
+            # CRITICAL: Verify we're using the training-capable model
+            if not self.using_training_model:
+                raise RuntimeError(
+                    "Cannot train with inference-only RWKV model! "
+                    "The inference-only 'rwkv' pip package does not support backward pass. "
+                    "Please use the training model from core/rwkv_training/ which includes "
+                    "wkv_cuda_backward operators from https://github.com/BlinkDL/RWKV-LM"
+                )
+            
             # [TLA+ Re-design: Physical Slicing for Dimensionality Reduction]
             # NEVER send useless context hidden states to the massive LM head!
             
