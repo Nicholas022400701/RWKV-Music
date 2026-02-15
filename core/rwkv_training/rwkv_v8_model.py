@@ -4,6 +4,25 @@
 #
 # This version is GPT-mode + RNN-mode, and a bit more difficult to understand
 #
+# CRITICAL NOTE ON TRAINING SUPPORT:
+# -----------------------------------
+# This implementation includes the forward pass and WKV7s CUDA kernel, but the backward pass
+# raises NotImplementedError (line 90-98). This is an inference-only implementation.
+# 
+# For full training with gradient computation, you need:
+# 1. A complete wkv_cuda_backward implementation
+# 2. Proper gradient computation through the WKV operator
+# 3. State tracking with requires_grad=True
+#
+# The current implementation wraps forward in torch.no_grad() which breaks autograd.
+# 
+# For production training:
+# - Either implement wkv_cuda_backward for WKV_7
+# - Or use a pure PyTorch implementation with torch.autograd.Function
+# - Or use the full RWKV-LM training codebase with all gradient operators
+#
+# The architecture.py wrapper works around this by using simplified batched operations
+# that maintain gradient flow, but these don't implement true RWKV time-decay mechanics.
 ########################################################################################################
 
 import numpy as np

@@ -213,7 +213,12 @@ def test_loss_alignment_e2e():
 # ============================================================================
 
 def test_backward_pass_e2e():
-    """Test that backward pass works without errors."""
+    """
+    Test that backward pass works without errors.
+    
+    NOTE: Uses simple mock model components to test gradient flow.
+    For full RWKV backward pass testing, see integration tests with actual model.
+    """
     print_test_header("Backward Pass (Gradient Computation)")
     
     try:
@@ -281,7 +286,17 @@ def test_backward_pass_e2e():
 # ============================================================================
 
 def test_training_step_e2e():
-    """Test a complete training step."""
+    """
+    Test a complete training step with mock model components.
+    
+    NOTE: This test uses vanilla PyTorch layers (Embedding + Linear) instead of
+    the full RWKV model because:
+    1. RWKV model requires pretrained weights file which isn't available in test env
+    2. RWKV CUDA kernels require compilation which may fail in CI
+    3. The test focuses on verifying the training loop logic, not RWKV internals
+    
+    For production validation, run integration tests with actual RWKV model.
+    """
     print_test_header("Training Step (Data → Forward → Loss → Backward → Update)")
     
     try:
