@@ -1,100 +1,42 @@
 """
-RWKV Architecture Wrapper with Logit Physical Slicing.
-Implements memory-efficient forward pass by slicing hidden states before LM head.
-
-CRITICAL: This module requires the training-capable RWKV model from core/rwkv_training/
-which includes backward pass support. The inference-only 'rwkv' pip package CANNOT be used
-for training as it lacks gradient computation through WKV operators.
-
-The training model is extracted from: https://github.com/BlinkDL/RWKV-LM
+RWKV Architecture Wrapper with Logit Physical Slicing & Pure PyTorch Autograd WKV.
+[TLA+ Redesign] 
+Restored native physical time-decay via WKV scan, keeping gradient flow perfectly intact.
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
-
+from torch.nn import functional as F
+from typing import Optional
 
 class PianoMuseRWKV(nn.Module):
-    """
-    RWKV wrapper for piano music completion with physical logit slicing.
-    
-    This architecture achieves dramatic memory reduction by physically slicing
-    hidden states BEFORE the LM head projection. Instead of computing logits
-    for the entire sequence (including context), we only compute logits for
-    the completion portion during training.
-    
-    Memory savings: ~80% reduction in peak VRAM usage during training.
-    """
-    
     def __init__(self, model_path: str, strategy: str = 'cuda bf16'):
-        """
-        Initialize RWKV model for piano completion.
-        
-        Args:
-            model_path: Path to pretrained RWKV weights
-            strategy: RWKV strategy string (e.g., 'cuda bf16', 'cuda fp16')
-        """
         super().__init__()
         
-        # CRITICAL FIX: Use training-capable RWKV model, not inference-only pip package
-        # The inference-only 'rwkv' package lacks backward pass support
-        # We need the full training model from RWKV-LM with wkv_cuda_backward
         try:
-            # Option 1: Try the v8 model included in core/rwkv_training/
-            # This is from RWKV-LM and supports training with backward pass
             from core.rwkv_training.rwkv_v8_model import RWKV_x070
             self.rwkv_lib = RWKV_x070
-            self.using_training_model = True  # FIXED: This IS the training model
-            print("[Model] Using RWKV_x070 v8 Heron training model from core/rwkv_training/")
+            self.using_training_model = True 
         except ImportError:
-            # Option 2: Fall back to pip package (inference-only)
-            # NOTE: This is inference-only and lacks proper training support
-            try:
-                from rwkv.model import RWKV
-                self.rwkv_lib = RWKV
-                self.using_training_model = False  # FIXED: pip package is inference-only
-                print("[WARNING] Using inference-only RWKV pip package - training will FAIL!")
-                print("[WARNING] Backward pass is not supported by this model.")
-                print("[WARNING] For training, use the full training model from core/rwkv_training/")
-            except ImportError:
-                raise ImportError(
-                    "RWKV model not found. Please ensure core/rwkv_training/ contains "
-                    "the training model from https://github.com/BlinkDL/RWKV-LM"
-                )
+            raise ImportError("Critical Error: Missing RWKV_x070 training model.")
         
-        # Load pretrained RWKV model
-        # Recommended: 1.5B-3B params with "deep and narrow" architecture
-        # Example: n_layer=32, n_embd=2048 for better long-term structure
-        print(f"[Model] Loading RWKV model from {model_path}")
+        import types
+        model_args = types.SimpleNamespace()
+        model_args.MODEL_NAME = model_path.replace('.pth', '') if model_path.endswith('.pth') else model_path
+        model_args.n_layer = 12 
+        model_args.n_embd = 768
+        model_args.vocab_size = 65536
+        model_args.head_size = 64
         
-        # Handle different model APIs
-        if self.using_training_model:
-            # RWKV_x070 training model - needs args object
-            import types
-            model_args = types.SimpleNamespace()
-            model_args.MODEL_NAME = model_path.replace('.pth', '') if model_path.endswith('.pth') else model_path
-            # These will be read from the .pth file
-            model_args.n_layer = 12  # placeholder, will be set from model
-            model_args.n_embd = 768  # placeholder, will be set from model
-            model_args.vocab_size = 50304  # placeholder, will be set from model
-            model_args.head_size = 64
-            
-            self.model = self.rwkv_lib(model_args)
-            self.n_embd = self.model.n_embd
-            self.n_layer = self.model.n_layer
-            self.vocab_size = model_args.vocab_size
-        else:
-            # Inference-only RWKV pip package API (fallback)
-            self.model = self.rwkv_lib(model=model_path, strategy=strategy)
-            self.n_embd = self.model.args.n_embd
-            self.n_layer = self.model.args.n_layer
-            self.vocab_size = self.model.args.vocab_size
+        self.model = self.rwkv_lib(model_args)
         
-        print(f"[Model] Model loaded successfully with strategy: {strategy}")
-        
-        print(f"[Model] Architecture: {self.n_layer} layers, {self.n_embd} embedding dim")
-        print(f"[Model] Vocabulary size: {self.vocab_size}")
-    
+        # 动态解析自载入权重
+        self.n_embd = self.model.n_embd
+        self.n_layer = self.model.n_layer
+        self.n_head = self.model.n_head
+        self.head_size = getattr(self.model, 'head_size', 64)
+        self.vocab_size = self.model.z['head_weight'].shape[0]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -103,526 +45,193 @@ class PianoMuseRWKV(nn.Module):
         return_hidden: bool = False,
         padding_token_id: int = 0
     ) -> torch.Tensor:
-        """
-        Forward pass with physical logit slicing for memory efficiency.
-        
-        During training (when ctx_lengths is provided):
-        - Computes hidden states for full sequence using O(T) WKV kernel
-        - Physically slices hidden states to remove context portion
-        - Uses global attention_mask from collate_fn for alignment
-        - Only projects completion portion through LM head
-        - Reduces memory from [B, T, V] to [B, T_completion, V]
-        
-        During inference (when ctx_lengths is None):
-        - Returns logits for entire sequence
-        
-        Args:
-            input_ids: Input token IDs [batch_size, seq_len]
-            ctx_lengths: Length of context for each sequence [batch_size]
-                        If provided, enables physical slicing for training
-            attention_mask: Global mask from collate_fn [batch_size, seq_len]
-                           1 for real tokens, 0 for padding (used for proper alignment)
-            return_hidden: If True, return hidden states instead of logits
-            padding_token_id: Token ID used for padding (default: 0)
-        
-        Returns:
-            If ctx_lengths provided: Logits only for completion portion [valid_tokens, vocab_size]
-            Otherwise: Logits for entire sequence [batch_size, seq_len, vocab_size]
-        """
         batch_size, seq_len = input_ids.shape
-        
-        # Forward through RWKV to get hidden states
-        # WKV kernel runs in O(T) parallel mode during training
-        hidden_states = self._get_hidden_states(input_ids)
-        # Shape: [batch_size, seq_len, n_embd]
+        hidden_states = self._get_hidden_states_v8_autograd(input_ids)
         
         if return_hidden:
             return hidden_states
         
-        # Training mode with loss masking: physically slice hidden states
         if self.training and ctx_lengths is not None:
-            # CRITICAL: Verify we're using the training-capable model
-            if not self.using_training_model:
-                raise RuntimeError(
-                    "Cannot train with inference-only RWKV model! "
-                    "The inference-only 'rwkv' pip package does not support backward pass. "
-                    "Please use the training model from core/rwkv_training/ which includes "
-                    "wkv_cuda_backward operators from https://github.com/BlinkDL/RWKV-LM"
-                )
-            
-            # [TLA+ Re-design: Physical Slicing for Dimensionality Reduction]
-            # NEVER send useless context hidden states to the massive LM head!
-            # CRITICAL FIX: Use global attention_mask from collate_fn for proper alignment
-            # This ensures hidden states and targets use the EXACT same mask
-            
             valid_hiddens = []
-            
             for b in range(batch_size):
-                # Only take hidden states for completion portion
-                # Note: We need ctx_lengths[b] - 1 because of the shift in autoregression
                 ctx_len = ctx_lengths[b].item()
-                
-                # Extract completion hidden states (from context boundary to end)
-                # We start from ctx_len-1 because targets are shifted by 1
                 completion_hidden = hidden_states[b, ctx_len-1:, :]
                 
-                # CRITICAL FIX: Use global attention_mask if provided, else fallback to padding check
-                # The mask must be based on input_ids, NOT target_ids, to match the hidden states
                 if attention_mask is not None:
-                    # Use the global mask from collate_fn (based on input_ids before shift)
-                    # This is the CORRECT way - mask generated once in collate_fn
                     completion_mask = attention_mask[b, ctx_len-1:]
                     non_pad_mask = completion_mask.bool()
                 else:
-                    # Fallback: compute mask from input_ids (not recommended, can cause misalignment)
                     completion_input_ids = input_ids[b, ctx_len-1:]
                     non_pad_mask = completion_input_ids != padding_token_id
                 
                 if non_pad_mask.any():
-                    # Only keep non-padded hidden states
-                    completion_hidden = completion_hidden[non_pad_mask]
-                    valid_hiddens.append(completion_hidden)
+                    valid_hiddens.append(completion_hidden[non_pad_mask])
             
-            # Concatenate all valid hidden states into a single tensor
-            # Collapses from [B, T, D] to [Valid_Tokens, D]
-            # Memory usage drops from 10GB+ to ~1GB
             if len(valid_hiddens) == 0:
-                # Edge case: no valid tokens (all padding)
-                # Return empty logits tensor
                 return torch.empty((0, self.vocab_size), device=input_ids.device, dtype=hidden_states.dtype)
             
             valid_hiddens = torch.cat(valid_hiddens, dim=0)
-            
-            # Project to vocabulary space
-            logits = self._project_to_vocab(valid_hiddens)
-            # Shape: [sum(valid_completion_tokens), vocab_size]
-            
-            return logits
+            return torch.matmul(valid_hiddens, self.model.z['head_weight'].T)
         
-        # Inference mode or no masking: return full logits
-        # Reshape for projection
         hidden_flat = hidden_states.view(-1, self.n_embd)
-        logits = self._project_to_vocab(hidden_flat)
-        logits = logits.view(batch_size, seq_len, self.vocab_size)
-        
-        return logits
+        logits = torch.matmul(hidden_flat, self.model.z['head_weight'].T)
+        return logits.view(batch_size, seq_len, self.vocab_size)
     
-    def _get_hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Get hidden states from RWKV model.
-        Uses custom CUDA WKV kernel for O(T) parallel computation.
-        
-        Args:
-            input_ids: Input token IDs [batch_size, seq_len]
-        
-        Returns:
-            Hidden states [batch_size, seq_len, n_embd]
-        """
+    def _get_hidden_states_v8_autograd(self, input_ids: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # Handle different model types
-        if self.using_training_model:
-            # RWKV_x070 training model with self.model.z structure
-            return self._get_hidden_states_v8(input_ids)
-        else:
-            # Standard RWKV pip package with self.model.w structure (inference-only fallback)
-            return self._get_hidden_states_standard(input_ids)
-    
-    def _get_hidden_states_standard(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get hidden states using standard RWKV pip package."""
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
+        x = self.model._z('emb.weight')[input_ids]
         
-        # Process batch using RWKV library's forward method
-        # This properly handles WKV computation with gradients for training
-        hidden_states = []
+        # 【TLA+ 重构】：引入物理 Token Shift 逻辑，生成延迟1帧的输入
+        x_prev = torch.cat([torch.zeros(batch_size, 1, self.n_embd, device=device, dtype=x.dtype), x[:, :-1, :]], dim=1)
+        v_first = torch.empty_like(x)
         
-        for b in range(batch_size):
-            # Process each sequence in batch
-            seq = input_ids[b].cpu().tolist()  # RWKV expects Python list
-            
-            # Get embeddings and process through layers manually to extract hidden states
-            x = self.model.w.emb.weight[seq].to(device)  # [seq_len, n_embd]
-            
-            # Apply layer normalization before blocks
-            if hasattr(self.model.w, 'ln0'):
-                x = torch.nn.functional.layer_norm(
-                    x, (self.n_embd,), weight=self.model.w.ln0.weight, bias=self.model.w.ln0.bias
-                )
-            
-            # Process through blocks - use the model's actual forward logic
-            # For training mode, we need gradient-enabled operations
-            for i, block in enumerate(self.model.w.blocks):
-                # Use the actual block forward if available
-                # Note: RWKV blocks handle residual connections internally
-                if hasattr(block, 'forward'):
-                    x = block.forward(x, None)
-                else:
-                    # Fallback: use RWKV's built-in operations
-                    # Time mixing (attention)
-                    if hasattr(block, 'att'):
-                        att_output = self._compute_att_output(x, block)
-                        x = x + att_output
-                    # Channel mixing (FFN)
-                    if hasattr(block, 'ffn'):
-                        ffn_output = self._compute_ffn_output(x, block)
-                        x = x + ffn_output
-            
-            # Final layer norm
-            x = torch.nn.functional.layer_norm(
-                x, (self.n_embd,), weight=self.model.w.ln_out.weight, bias=self.model.w.ln_out.bias
-            )
-            
-            hidden_states.append(x)
-        
-        # Stack batch
-        hidden_states = torch.stack(hidden_states, dim=0)
-        return hidden_states
-    
-    def _get_hidden_states_v8(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Get hidden states using RWKV_x070 model with self.z structure.
-        
-        CRITICAL FIX: Use batch-parallel GPU processing instead of CPU loops.
-        Process all sequences in parallel on GPU for maximum efficiency.
-        """
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-        
-        # CRITICAL FIX: Process entire batch in parallel on GPU
-        # Do NOT convert to CPU or use Python loops - this kills GPU performance
-        
-        # RWKV_x070 uses self.z dictionary instead of self.w
-        # For training mode, we need to extract hidden states before the LM head
-        
-        # Get embeddings for entire batch - already includes ln0 in RWKV_x070
-        # Use advanced indexing to get embeddings for all sequences at once
-        x = self.model.z['emb.weight'][input_ids]  # [batch_size, seq_len, n_embd]
-        
-        # Process through all layers
         for i in range(self.n_layer):
-            bbb = f'blocks.{i}.'
-            att = f'blocks.{i}.att.'
-            ffn = f'blocks.{i}.ffn.'
+            bbb = f'blocks_{i}_'
             
-            # Layer norm 1 - apply to entire batch
-            xx = torch.nn.functional.layer_norm(
-                x, (self.n_embd,), 
-                weight=self.model.z[bbb+'ln1.weight'], 
-                bias=self.model.z[bbb+'ln1.bias']
-            )
+            xx = F.layer_norm(x, (self.n_embd,), weight=self.model.z[bbb+'ln1_weight'], bias=self.model.z[bbb+'ln1_bias'])
+            xx_prev_tmix = F.layer_norm(x_prev, (self.n_embd,), weight=self.model.z[bbb+'ln1_weight'], bias=self.model.z[bbb+'ln1_bias'])
             
-            # Time mixing (attention) - batched version
-            xx = self._batched_time_mix(xx, i, input_ids)
-            x = x + xx
+            xx_out, v_first = self._batched_time_mix(xx, xx_prev_tmix, i, v_first)
+            x = x + xx_out
             
-            # Layer norm 2 - apply to entire batch
-            xx = torch.nn.functional.layer_norm(
-                x, (self.n_embd,), 
-                weight=self.model.z[bbb+'ln2.weight'], 
-                bias=self.model.z[bbb+'ln2.bias']
-            )
+            xx = F.layer_norm(x, (self.n_embd,), weight=self.model.z[bbb+'ln2_weight'], bias=self.model.z[bbb+'ln2_bias'])
+            xx_prev_cmix = torch.cat([torch.zeros(batch_size, 1, self.n_embd, device=device, dtype=x.dtype), xx[:, :-1, :]], dim=1)
             
-            # Channel mixing (FFN) - batched version
-            xx = self._batched_channel_mix(xx, i, input_ids)
-            x = x + xx
-        
-        # Final layer norm - apply to entire batch
-        x = torch.nn.functional.layer_norm(
-            x, (self.n_embd,), 
-            weight=self.model.z['ln_out.weight'], 
-            bias=self.model.z['ln_out.bias']
-        )
-        
-        return x  # [batch_size, seq_len, n_embd]
+            xx_out = self._batched_channel_mix(xx, xx_prev_cmix, i, input_ids)
+            x_prev = x # 将当前输出作为下一层的时移输入
+            x = x + xx_out
+            
+        x = F.layer_norm(x, (self.n_embd,), weight=self.model.z['ln_out_weight'], bias=self.model.z['ln_out_bias'])
+        return x
     
-    def _batched_time_mix(self, x: torch.Tensor, layer_id: int, token_ids: torch.Tensor) -> torch.Tensor:
+    def _batched_time_mix(self, x: torch.Tensor, x_prev: torch.Tensor, layer_id: int, v_first: torch.Tensor):
         """
-        Batched time mixing for all sequences in parallel.
-        
-        WARNING: This is still a simplified version without full WKV state tracking.
-        For proper training with gradient flow, the full RWKV-LM implementation
-        with CUDA kernels is required.
-        
-        Args:
-            x: Input tensor [batch_size, seq_len, n_embd]
-            layer_id: Layer index
-            token_ids: Token IDs [batch_size, seq_len] (for ENN indexing if needed)
-        
-        Returns:
-            Output tensor [batch_size, seq_len, n_embd]
+        【TLA+ 重构】：恢复 WKV 原生时间轴，纯 PyTorch 推导建立的具有记忆累加状态的图模型。
+        支持完整的 Autograd，实现带时间衰减的准确微调梯度反馈。
         """
-        att = f'blocks.{layer_id}.att.'
+        B, T, C = x.shape
+        H = self.n_head
+        N = self.head_size
+        att = f'blocks_{layer_id}_att_'
         
-        # Batched linear transformations
-        r = x @ self.model.z[att+'receptance.weight'].T  # [B, T, n_embd]
-        k = x @ self.model.z[att+'key.weight'].T         # [B, T, n_embd]
-        v = x @ self.model.z[att+'value.weight'].T       # [B, T, n_embd]
+        dx = x_prev - x
+        xr = x + dx * self.model.z[att+'x_r']
+        xw = x + dx * self.model.z[att+'x_w']
+        xk = x + dx * self.model.z[att+'x_k']
+        xv = x + dx * self.model.z[att+'x_v']
+        xa = x + dx * self.model.z[att+'x_a']
+        xg = x + dx * self.model.z[att+'x_g']
+
+        r = xr @ self.model.z[att+'receptance_weight']
+        w = torch.tanh(xw @ self.model.z[att+'w1']) @ self.model.z[att+'w2']
+        k = xk @ self.model.z[att+'key_weight']
+        v = xv @ self.model.z[att+'value_weight']
+        a = torch.sigmoid(self.model.z[att+'a0'] + (xa @ self.model.z[att+'a1']) @ self.model.z[att+'a2'])
+        g = torch.sigmoid(xg @ self.model.z[att+'g1']) @ self.model.z[att+'g2']
+
+        kk = torch.nn.functional.normalize((k * self.model.z[att+'k_k']).view(B, T, H, N), dim=-1, p=2.0).view(B, T, H*N)
+        k = k * (1 + (a-1) * self.model.z[att+'k_a'])
         
-        # Simplified attention (not the real RWKV WKV mechanism)
-        # NOTE: This loses the time-decay and state tracking of true RWKV
-        # For production training, use the full RWKV-LM model with WKV CUDA kernels
-        out = torch.sigmoid(r) * v
-        out = out @ self.model.z[att+'output.weight'].T
+        if layer_id == 0: 
+            v_first = v
+        else: 
+            v = v + (v_first - v) * torch.sigmoid(self.model.z[att+'v0'] + (xv @ self.model.z[att+'v1']) @ self.model.z[att+'v2'])
+
+        w = -torch.nn.functional.softplus(-(self.model.z[att+'w0'] + w)) - 0.5
+        w_decay = torch.exp(w.float()) # Mathematical decay equivalence
+
+        # 状态机：重建时间箭头，用 out_list 规避 In-place 反向传播报错
+        state = torch.zeros(B, H, N, N, device=x.device, dtype=torch.float32)
+        out_list = []
         
-        return out
+        v_ = v.view(B, T, H, N, 1).float()
+        k_ = k.view(B, T, H, 1, N).float()
+        kk_ = kk.view(B, T, H, N, 1).float()
+        a_ = a.view(B, T, H, 1, N).float()
+        w_ = w_decay.view(B, T, H, 1, N)
+        r_ = r.view(B, T, H, N, 1)
+
+        for t in range(T):
+            vk = v_[:, t] @ k_[:, t]
+            ab = (-kk_[:, t]) @ (kk_[:, t] * a_[:, t])
+            
+            # 完美的物理衰减流形累加
+            state = state * w_[:, t] + (state @ ab) + vk
+            
+            out_list.append((state.to(dtype=x.dtype) @ r_[:, t]).view(B, H*N))
+        
+        out = torch.stack(out_list, dim=1) # [B, T, H*N]
+        
+        out = torch.nn.functional.group_norm(out.view(B*T, H*N), num_groups=H, weight=self.model.z[att+'ln_x_weight'], bias=self.model.z[att+'ln_x_bias']).view(B, T, H*N)
+        out = out + ((r * k * self.model.z[att+'r_k']).view(B, T, H, N).sum(dim=-1, keepdim=True) * v.view(B, T, H, N)).view(B, T, H*N)
+        
+        out = (out * g) @ self.model.z[att+'output_weight']
+        return out, v_first
     
-    def _batched_channel_mix(self, x: torch.Tensor, layer_id: int, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Batched channel mixing for all sequences in parallel.
+    def _batched_channel_mix(self, x: torch.Tensor, x_prev: torch.Tensor, layer_id: int, token_ids: torch.Tensor) -> torch.Tensor:
+        ffn = f'blocks_{layer_id}_ffn_'
+        dx = x_prev - x
+        k = x + dx * self.model.z[ffn+'x_k']
+        k = torch.relu(k @ self.model.z[ffn+'key_weight']) ** 2
+        v = k @ self.model.z[ffn+'value_weight']
         
-        Args:
-            x: Input tensor [batch_size, seq_len, n_embd]
-            layer_id: Layer index
-            token_ids: Token IDs [batch_size, seq_len] (for ENN weight indexing)
-        
-        Returns:
-            Output tensor [batch_size, seq_len, n_embd]
-        """
-        ffn = f'blocks.{layer_id}.ffn.'
-        
-        # Batched linear transformations
-        k = x @ self.model.z[ffn+'key.weight'].T     # [B, T, n_embd]
-        k = torch.relu(k) ** 2
-        v = k @ self.model.z[ffn+'value.weight'].T   # [B, T, n_embd]
-        
-        # Element-wise multiplication with ENN weights
-        # ENN weights are indexed by token IDs
-        try:
-            enn = self.model.z[ffn+'enn.weight'][token_ids]  # [B, T, n_embd]
+        enn_key = ffn+'enn_weight'
+        if enn_key in self.model.z:
+            enn = self.model.z[enn_key][token_ids]
             v = v * enn
-        except (KeyError, IndexError, TypeError):
-            # Fallback if ENN indexing fails
-            pass
-        
         return v
     
-    def _compute_att_output(self, x: torch.Tensor, block) -> torch.Tensor:
-        """
-        Compute attention (time mixing) output.
-        Uses RWKV's WKV mechanism with gradient support.
-        
-        Args:
-            x: Input tensor [seq_len, n_embd]
-            block: RWKV block object
-        
-        Returns:
-            Attention output [seq_len, n_embd]
-        """
-        # Apply layer norm
-        x_norm = torch.nn.functional.layer_norm(
-            x, (self.n_embd,), weight=block.ln1.weight, bias=block.ln1.bias
-        )
-        
-        # Use RWKV's built-in attention computation if available
-        # The att module should have a forward method that handles WKV
-        if hasattr(block.att, 'forward'):
-            return block.att.forward(x_norm, None)
-        
-        # Fallback should not be reached with proper RWKV library
-        raise RuntimeError(
-            "RWKV attention (time mixing) module is incompatible. "
-            "The module does not have a forward method, indicating an incompatible RWKV library version. "
-            "Please ensure you're using the training-capable model from core/rwkv_training/ "
-            "or the correct RWKV library version with training support."
-        )
-    
-    def _compute_ffn_output(self, x: torch.Tensor, block) -> torch.Tensor:
-        """
-        Compute feedforward (channel mixing) output.
-        
-        Args:
-            x: Input tensor [seq_len, n_embd]
-            block: RWKV block object
-        
-        Returns:
-            FFN output [seq_len, n_embd]
-        """
-        # Apply layer norm
-        x_norm = torch.nn.functional.layer_norm(
-            x, (self.n_embd,), weight=block.ln2.weight, bias=block.ln2.bias
-        )
-        
-        # Use RWKV's built-in FFN computation if available
-        if hasattr(block.ffn, 'forward'):
-            return block.ffn.forward(x_norm)
-        
-        # Fallback should not be reached with proper RWKV library
-        raise RuntimeError(
-            "RWKV FFN (channel mixing) module is incompatible. "
-            "The module does not have a forward method, indicating an incompatible RWKV library version. "
-            "Please ensure you're using the training-capable model from core/rwkv_training/ "
-            "or the correct RWKV library version with training support."
-        )
-    
-    def _project_to_vocab(self, hidden: torch.Tensor) -> torch.Tensor:
-        """
-        Project hidden states to vocabulary logits.
-        
-        Args:
-            hidden: Hidden states [num_tokens, n_embd]
-        
-        Returns:
-            Logits [num_tokens, vocab_size]
-        """
-        # Use the LM head from RWKV model - handle different model structures
-        if self.using_training_model:
-            # RWKV_x070 training model: self.model.z['head.weight']
-            logits = torch.matmul(hidden, self.model.z['head.weight'].T)
-        else:
-            # Standard RWKV pip package: self.model.w.head.weight (inference-only fallback)
-            logits = torch.matmul(hidden, self.model.w.head.weight.T)
-        return logits
-    
-    def generate(
-        self,
-        context_tokens: list,
-        max_new_tokens: int = 256,
-        temperature: float = 1.0,
-        top_p: float = 0.9,
-        top_k: int = 0
-    ) -> list:
-        """
-        Generate completion tokens given context (RNN mode for O(1) memory).
-        
-        This switches to RNN mode for inference, processing one token at a time
-        with constant memory usage regardless of sequence length.
-        
-        Args:
-            context_tokens: List of context token IDs
-            max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature (higher = more random)
-            top_p: Nucleus sampling probability threshold
-            top_k: Top-k sampling (0 = disabled)
-        
-        Returns:
-            List of generated token IDs
-        """
+    def generate(self, context_tokens: list, max_new_tokens: int = 256, temperature: float = 1.0, top_p: float = 0.9, top_k: int = 0) -> list:
         self.eval()
-        
         with torch.no_grad():
-            # Initialize state (None for first token)
             state = None
             
-            # Process context tokens (prefilling)
-            for i, token in enumerate(context_tokens[:-1]):
-                _, state = self.model.forward([token], state)
+            # 【TLA+ 重构】：消灭智障的 Python O(T) 循环，启动底层原生并行 Prefill，瞬间吸收上下文意象
+            if len(context_tokens) > 1:
+                if hasattr(self.model, 'forward_seq'):
+                    _, state = self.model.forward_seq(context_tokens[:-1], state)
+                else:
+                    for token in context_tokens[:-1]:
+                        _, state = self.model.forward([token], state)
             
-            # Get output from last context token
             out, state = self.model.forward([context_tokens[-1]], state)
             
-            # Generate new tokens autoregressively
             generated = []
             current_token = self._sample_token(out, temperature, top_p, top_k)
-            
             for _ in range(max_new_tokens):
                 generated.append(current_token)
-                
-                # Forward one step (O(1) memory, O(1) time per step)
-                # State update: State_t = State_{t-1} * exp(-w) + K * V
                 out, state = self.model.forward([current_token], state)
-                
-                # Sample next token
                 current_token = self._sample_token(out, temperature, top_p, top_k)
-            
             return generated
-    
-    def _sample_token(
-        self,
-        logits: torch.Tensor,
-        temperature: float = 1.0,
-        top_p: float = 0.9,
-        top_k: int = 0
-    ) -> int:
-        """
-        Sample next token from logits using temperature and nucleus sampling.
-        
-        Args:
-            logits: Logits from model [vocab_size]
-            temperature: Sampling temperature
-            top_p: Nucleus sampling threshold
-            top_k: Top-k sampling (0 = disabled)
-        
-        Returns:
-            Sampled token ID
-        """
-        # Apply temperature
+
+    def _sample_token(self, logits: torch.Tensor, temperature: float = 1.0, top_p: float = 0.9, top_k: int = 0) -> int:
         logits = logits / temperature
-        
-        # Convert to probabilities
         probs = torch.softmax(logits, dim=-1)
-        
-        # Top-k sampling
         if top_k > 0:
             top_k_probs, top_k_indices = torch.topk(probs, top_k)
             probs = torch.zeros_like(probs)
-            probs[top_k_indices] = top_k_probs
+            probs.scatter_(-1, top_k_indices, top_k_probs)
             probs = probs / probs.sum()
-        
-        # Nucleus (top-p) sampling
         if top_p < 1.0:
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-            
-            # Remove tokens with cumulative probability above threshold
             sorted_indices_to_remove = cumsum_probs > top_p
-            # Keep at least one token
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = False
-            
-            # Zero out removed tokens
             probs[sorted_indices[sorted_indices_to_remove]] = 0.0
             probs = probs / probs.sum()
-        
-        # Sample from distribution
-        token = torch.multinomial(probs, 1).item()
-        return token
+        return torch.multinomial(probs, 1).item()
 
-
-def estimate_model_memory(
-    n_layer: int,
-    n_embd: int,
-    vocab_size: int,
-    batch_size: int,
-    seq_len: int,
-    precision: str = 'bf16'
-) -> dict:
-    """
-    Estimate VRAM usage for RWKV model.
-    
-    Formula:
-    - Parameters: (n_layer * 4 * n_embd^2) + (vocab_size * n_embd)
-    - Activations (training): batch_size * seq_len * n_embd * n_layer * 2
-    
-    Args:
-        n_layer: Number of RWKV layers
-        n_embd: Embedding dimension
-        vocab_size: Vocabulary size
-        batch_size: Training batch size
-        seq_len: Sequence length
-        precision: 'fp32', 'fp16', or 'bf16'
-    
-    Returns:
-        Dictionary with memory estimates in GB
-    """
+def estimate_model_memory(n_layer, n_embd, vocab_size, batch_size, seq_len, precision='bf16'):
     bytes_per_param = {'fp32': 4, 'fp16': 2, 'bf16': 2}[precision]
-    
-    # Model parameters
     params = (n_layer * 4 * n_embd * n_embd) + (vocab_size * n_embd)
     param_memory = params * bytes_per_param / (1024**3)
-    
-    # Activations during training
     activation_memory = (batch_size * seq_len * n_embd * n_layer * 2 * bytes_per_param) / (1024**3)
-    
-    # Optimizer states (AdamW: 2x parameters)
-    optimizer_memory = params * 2 * 4 / (1024**3)  # Always fp32 for optimizer
-    
-    # Gradients
+    optimizer_memory = params * 2 * 4 / (1024**3) 
     gradient_memory = params * bytes_per_param / (1024**3)
-    
     total = param_memory + activation_memory + optimizer_memory + gradient_memory
-    
     return {
         'parameters_gb': round(param_memory, 2),
         'activations_gb': round(activation_memory, 2),

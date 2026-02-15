@@ -25,10 +25,11 @@ def generate_inspiration(
     top_k: int = 0
 ) -> list:
     """
-    Generate musical completion given context using RNN mode.
+    Generate musical completion given context using RNN mode with parallel prefill.
     
     The beauty of RWKV: During training, use parallel O(T) mode for efficiency.
-    During inference, switch to RNN mode for O(1) memory per step.
+    During inference, use parallel prefill for fast context processing,
+    then switch to RNN mode for O(1) memory per step generation.
     
     All musical history, melodic motifs, harmonic progressions are losslessly
     compressed into an O(1) state matrix through exponential decay.
@@ -44,43 +45,55 @@ def generate_inspiration(
     Returns:
         List of generated token IDs
     """
-    # Initialize state (None for first token)
-    # Musical memory represented as a constant-size state matrix
-    state = None
+    # Use the model's generate method which includes parallel prefill optimization
+    print(f"\n[Generation] Utilizing Parallel Prefill for {len(context_tokens)} context tokens...")
     
-    print(f"[Generation] Processing {len(context_tokens)} context tokens...")
-    
-    # Phase 1: Prefill context (consume context to build state)
-    for i, token in enumerate(context_tokens[:-1]):
-        if (i + 1) % 100 == 0:
-            print(f"[Generation] Processed {i+1}/{len(context_tokens)} context tokens")
-        _, state = model.forward([token], state)
-    
-    # Get output from last context token
-    out, state = model.forward([context_tokens[-1]], state)
-    
-    print(f"[Generation] Context processed. Starting generation...")
-    
-    # Phase 2: Autoregressive generation with constant memory
-    generated = []
-    current_token = sample_token(out, temperature, top_p, top_k)
-    
-    for step in range(max_new_tokens):
-        generated.append(current_token)
+    # Check if model has the optimized generate method
+    if hasattr(model, 'generate'):
+        # Use the optimized generate method with parallel prefill
+        generated_tokens = model.generate(
+            context_tokens,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k
+        )
+    else:
+        # Fallback to manual generation if generate method not available
+        print("[WARNING] Model doesn't have generate method, using fallback implementation")
+        state = None
         
-        if (step + 1) % 50 == 0:
-            print(f"[Generation] Generated {step+1}/{max_new_tokens} tokens")
+        print(f"[Generation] Processing {len(context_tokens)} context tokens...")
         
-        # Forward one step: O(1) memory, O(1) time
-        # State update: State_t = State_{t-1} * exp(-w) + K * V
-        # This is the mathematical equivalence that makes RWKV efficient
-        out, state = model.forward([current_token], state)
+        # Phase 1: Prefill context (consume context to build state)
+        for i, token in enumerate(context_tokens[:-1]):
+            if (i + 1) % 100 == 0:
+                print(f"[Generation] Processed {i+1}/{len(context_tokens)} context tokens")
+            _, state = model.forward([token], state)
         
-        # Sample next token with temperature and nucleus sampling
+        # Get output from last context token
+        out, state = model.forward([context_tokens[-1]], state)
+        
+        print(f"[Generation] Context processed. Starting generation...")
+        
+        # Phase 2: Autoregressive generation with constant memory
+        generated_tokens = []
         current_token = sample_token(out, temperature, top_p, top_k)
+        
+        for step in range(max_new_tokens):
+            generated_tokens.append(current_token)
+            
+            if (step + 1) % 50 == 0:
+                print(f"[Generation] Generated {step+1}/{max_new_tokens} tokens")
+            
+            # Forward one step: O(1) memory, O(1) time
+            out, state = model.forward([current_token], state)
+            
+            # Sample next token with temperature and nucleus sampling
+            current_token = sample_token(out, temperature, top_p, top_k)
     
-    print(f"[Generation] Complete! Generated {len(generated)} tokens")
-    return generated
+    print(f"[Generation] Complete! Generated {len(generated_tokens)} tokens")
+    return generated_tokens
 
 
 def sample_token(

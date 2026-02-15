@@ -132,6 +132,20 @@ class PianoTokenizer:
                 
         return metadata
     
+    def is_structural_token(self, token_id: int) -> bool:
+        """
+        Check if a token represents an atomic musical boundary.
+        Used for safe truncation to avoid breaking NoteOn/Pitch/Velocity groups.
+        
+        Args:
+            token_id: Token ID to check
+            
+        Returns:
+            True if token is a structural boundary (Bar, Pitch, NoteOn, Tempo, TimeSig)
+        """
+        token_str = self.tokenizer.id_to_token(token_id)
+        return token_str.startswith(("Bar", "Pitch", "NoteOn", "Tempo", "TimeSig"))
+    
     def get_vocab_size(self) -> int:
         """Get the vocabulary size of the tokenizer."""
         return len(self.tokenizer.vocab)

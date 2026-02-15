@@ -19,6 +19,7 @@ hijack_windows_cuda_env()
 
 from core.architecture import PianoMuseRWKV, estimate_model_memory
 from core.dataset import CopilotDataset, collate_fn, load_dataset
+from core.tokenization import PianoTokenizer
 
 
 def compute_loss_with_masking(
@@ -214,7 +215,10 @@ def main(args):
     print("Loading Dataset")
     print("=" * 70)
     data_pairs = load_dataset(args.data_path)
-    dataset = CopilotDataset(data_pairs, max_seq_len=args.max_seq_len)
+    
+    # Instantiate tokenizer for safe structural boundary detection
+    tokenizer = PianoTokenizer(vocab_size=args.vocab_size)
+    dataset = CopilotDataset(data_pairs, max_seq_len=args.max_seq_len, tokenizer=tokenizer)
     
     # Create dataloader with efficient multi-worker loading
     dataloader = DataLoader(
